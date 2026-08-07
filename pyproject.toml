@@ -1,0 +1,64 @@
+[project]
+name = "chamber"
+version = "0.9.0"
+description = "A headed browser an LLM can drive in the open — visible cursor, visible reasoning, durable actions"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "playwright>=1.61.0",
+    "pydantic>=2.9.0",
+    "httpx>=0.28.0",
+    "typer>=0.15.0",
+    "rich>=13.9.0",
+    "python-dotenv>=1.0.0",
+    # Readable-content extraction. The in-page script owns geometry and refs, which
+    # need live layout; everything about *reading* the page is a pure function from
+    # HTML to text, so it lives here where it can be unit-tested without a browser.
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.3.0",
+]
+
+[project.optional-dependencies]
+# The MCP surface. Optional because the CLI loop and the library work without it,
+# and harnesses that embed chamber directly never import it.
+mcp = ["mcp>=1.2.0"]
+
+[project.scripts]
+chamber = "chamber.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chamber"]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+    "E501",   # line length — the formatter's job, and prose comments run long
+    "B008",   # typer declares CLI options as call defaults; that is the idiom
+    "RUF001", # "×" and "→" in model-facing strings are deliberate, not typos
+    "RUF002", # same, in docstrings
+    "RUF003", # same, in comments describing those strings
+]
