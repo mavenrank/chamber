@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# uv
+.venv/
+
+# Secrets
+.env
+*.key
+auth.json
+
+# Runtime state — profiles hold real cookies and logins, never commit them
+.chamber/
+runs/
+*.sqlite
+*.sqlite-journal
+
+# Artifacts
+*.png
+*.har
+*.trace.zip
