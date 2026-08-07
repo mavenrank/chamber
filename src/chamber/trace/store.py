@@ -1,0 +1,346 @@
+"""What happened, kept.
+
+A run that produces an answer without a trail is a worse product than one that
+shows its work, and the difference is most of the point here: "research this and
+show me your sources" is not answerable without a record of every page opened, in
+order, with what came out of it.
+
+SQLite, one file, no server. Rows are appended and never deleted — a page the agent
+visited and rejected is *evidence*, and pruning it would hide the most interesting
+part of the trail.
+
+The schema is deliberately flat. A run has steps, a step has actions, and a visit
+records one page the agent actually looked at. The "tree" of a research session is
+reconstructed by joining on step order rather than stored as nested structure,
+because the interesting groupings (by domain, by query, by whether it fed the
+answer) are all different views of the same rows.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import sqlite3
+import time
+from collections.abc import Iterator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from chamber import paths
+from chamber.urls import canonical
+
+log = logging.getLogger(__name__)
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS run (
+    id          TEXT PRIMARY KEY,
+    task        TEXT NOT NULL,
+    profile     TEXT NOT NULL,
+    model       TEXT,
+    started_at  REAL NOT NULL,
+    ended_at    REAL,
+    success     INTEGER,
+    summary     TEXT,
+    stopped_because TEXT,
+    input_tokens  INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS step (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id   TEXT NOT NULL REFERENCES run(id),
+    n        INTEGER NOT NULL,
+    thought  TEXT,
+    url      TEXT,
+    title    TEXT,
+    fingerprint TEXT,
+    ms       INTEGER,
+    at       REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS action (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id   TEXT NOT NULL REFERENCES run(id),
+    step_n   INTEGER NOT NULL,
+    seq      INTEGER NOT NULL,
+    name     TEXT NOT NULL,
+    args     TEXT,
+    why      TEXT,
+    outcome  TEXT NOT NULL,
+    message  TEXT,
+    repairs  TEXT,
+    ms       INTEGER,
+    at       REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS visit (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id    TEXT NOT NULL REFERENCES run(id),
+    step_n    INTEGER,
+    url       TEXT NOT NULL,
+    canonical TEXT NOT NULL,
+    title     TEXT,
+    content_chars INTEGER DEFAULT 0,
+    controls  INTEGER DEFAULT 0,
+    used      INTEGER DEFAULT 0,
+    note      TEXT,
+    at        REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_step_run   ON step(run_id, n);
+CREATE INDEX IF NOT EXISTS idx_action_run ON action(run_id, step_n, seq);
+CREATE INDEX IF NOT EXISTS idx_visit_run  ON visit(run_id);
+CREATE INDEX IF NOT EXISTS idx_visit_canon ON visit(canonical);
+"""
+
+
+def canonical_url(url: str) -> str:
+    """A stable identity for the same page reached by different routes.
+
+    Without this, deduplication finds almost nothing: the same article reached from
+    three places carries three different `utm_source` values and compares unequal
+    every time. Shared with the reader — see `chamber/urls.py`.
+    """
+    return canonical(url)
+
+
+@dataclass(slots=True)
+class TraceStore:
+    conn: sqlite3.Connection
+    run_id: str = ""
+
+    # ------------------------------------------------------------------ writes
+
+    def start_run(
+        self, run_id: str, task: str, *, profile: str, model: str = ""
+    ) -> None:
+        self.run_id = run_id
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO run (id, task, profile, model, started_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (run_id, task, profile, model, time.time()),
+            )
+
+    def end_run(
+        self,
+        *,
+        success: bool,
+        summary: str,
+        stopped_because: str = "",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE run SET ended_at=?, success=?, summary=?, stopped_because=?, "
+                "input_tokens=?, output_tokens=? WHERE id=?",
+                (
+                    time.time(),
+                    int(success),
+                    summary,
+                    stopped_because,
+                    input_tokens,
+                    output_tokens,
+                    self.run_id,
+                ),
+            )
+
+    def record_step(
+        self, n: int, *, thought: str, url: str, title: str = "", fingerprint: str = "", ms: int = 0
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO step (run_id, n, thought, url, title, fingerprint, ms, at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (self.run_id, n, thought, url, title, fingerprint, ms, time.time()),
+            )
+
+    def record_action(
+        self,
+        step_n: int,
+        seq: int,
+        *,
+        name: str,
+        args: dict[str, Any],
+        why: str,
+        outcome: str,
+        message: str = "",
+        repairs: list[str] | None = None,
+        ms: int = 0,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO action (run_id, step_n, seq, name, args, why, outcome, "
+                "message, repairs, ms, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    self.run_id,
+                    step_n,
+                    seq,
+                    name,
+                    json.dumps(args, default=str)[:4000],
+                    why,
+                    outcome,
+                    message[:2000],
+                    json.dumps(repairs or []),
+                    ms,
+                    time.time(),
+                ),
+            )
+
+    def record_visit(
+        self,
+        url: str,
+        *,
+        step_n: int | None = None,
+        title: str = "",
+        content_chars: int = 0,
+        controls: int = 0,
+        note: str = "",
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO visit (run_id, step_n, url, canonical, title, "
+                "content_chars, controls, note, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    self.run_id,
+                    step_n,
+                    url,
+                    canonical_url(url),
+                    title,
+                    content_chars,
+                    controls,
+                    note,
+                    time.time(),
+                ),
+            )
+
+    def mark_used(self, urls: list[str]) -> None:
+        """Flag the pages that actually fed the answer.
+
+        The distinction between "looked at" and "used" is what turns a visit log
+        into a source list.
+        """
+        canon = [canonical_url(u) for u in urls]
+        with self.conn:
+            self.conn.executemany(
+                "UPDATE visit SET used=1 WHERE run_id=? AND canonical=?",
+                [(self.run_id, c) for c in canon],
+            )
+
+    # ------------------------------------------------------------------- reads
+
+    def runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM run ORDER BY started_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def run(self, run_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM run WHERE id=?", (run_id,)).fetchone()
+        return dict(row) if row else None
+
+    def steps(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM step WHERE run_id=? ORDER BY n", (run_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def actions(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM action WHERE run_id=? ORDER BY step_n, seq", (run_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def sources(self, run_id: str, *, used_only: bool = False) -> list[dict[str, Any]]:
+        """Distinct pages visited, in the order first seen.
+
+        Grouped by canonical URL with a visit count, so a page the agent returned
+        to shows as one source with weight rather than three separate entries.
+        """
+        clause = "AND used=1" if used_only else ""
+        # Ordered by rowid, not timestamp. Two visits recorded in the same tick tie
+        # on `at` — the clock's resolution is coarser than the loop — and the order
+        # of the trail becomes nondeterministic. The rowid is insertion order by
+        # definition.
+        rows = self.conn.execute(
+            f"""
+            SELECT canonical, MIN(id) AS seq, MIN(at) AS first_seen, COUNT(*) AS visits,
+                   MAX(title) AS title, MAX(content_chars) AS content_chars,
+                   MAX(used) AS used, MAX(url) AS url
+            FROM visit WHERE run_id=? {clause}
+            GROUP BY canonical ORDER BY seq
+            """,
+            (run_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def timeline(self, run_id: str) -> str:
+        """The run as an indented tree — steps, their actions, and the pages seen."""
+        run = self.run(run_id)
+        if run is None:
+            return f"no such run: {run_id}"
+
+        lines = [
+            f"run {run_id}",
+            f"  task: {run['task']}",
+            f"  model: {run['model'] or '(none)'} · profile: {run['profile']}",
+        ]
+
+        by_step: dict[int, list[dict[str, Any]]] = {}
+        for action in self.actions(run_id):
+            by_step.setdefault(action["step_n"], []).append(action)
+
+        # A step row is written *after* its actions, so a run that was interrupted
+        # mid-step leaves actions with no step. Those are the most interesting
+        # actions in the trace — they are what the run died doing — so the union of
+        # both tables is walked rather than just the step table.
+        steps_by_n = {s["n"]: s for s in self.steps(run_id)}
+        for n in sorted(set(steps_by_n) | set(by_step)):
+            step = steps_by_n.get(n)
+            if step is None:
+                lines.append(f"  • step {n}  [incomplete — the run stopped here]")
+            else:
+                lines.append(f"  • step {n}  {step['url'][:70]}")
+                if step["thought"]:
+                    lines.append(f"      “{step['thought'][:110]}”")
+            for action in by_step.get(n, []):
+                ok = "✓" if action["outcome"] == "ok" else "✗"
+                detail = (action["message"] or "")[:80]
+                lines.append(f"      {ok} {action['name']:<14} {detail}")
+                for repair in json.loads(action["repairs"] or "[]"):
+                    lines.append(f"          ↳ chamber adjusted: {repair}")
+
+        sources = self.sources(run_id)
+        if sources:
+            lines.append("")
+            lines.append(f"  sources ({len(sources)} distinct pages)")
+            for source in sources:
+                flag = "★" if source["used"] else " "
+                visits = f" ×{source['visits']}" if source["visits"] > 1 else ""
+                lines.append(
+                    f"    {flag} {source['canonical'][:80]}{visits}"
+                    + (f"  — {source['title'][:40]}" if source["title"] else "")
+                )
+
+        if run["summary"]:
+            lines.append("")
+            lines.append(f"  result: {'✓' if run['success'] else '✗'} {run['summary'][:400]}")
+        return "\n".join(lines)
+
+
+@contextlib.contextmanager
+def open_store(path: Path | None = None) -> Iterator[TraceStore]:
+    """Open (and migrate) the trace database."""
+    target = path or paths.db_path()
+    conn = sqlite3.connect(target)
+    conn.row_factory = sqlite3.Row
+    # WAL so a reader (a status view, another shell) can look at a live run.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(_SCHEMA)
+    try:
+        yield TraceStore(conn)
+    finally:
+        conn.close()
