@@ -27,7 +27,7 @@ import asyncio
 import logging
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -88,6 +88,17 @@ class RunResult:
 # forwards them as progress notifications.
 Listener = Callable[[str, dict[str, Any]], None]
 
+# Contributes extra text to a step's input, given the session and the fresh
+# observation. This is the seam an embedder uses to put domain knowledge in front of
+# the model without teaching chamber the domain: work out whatever your application
+# knows — a classification of the page, what you have already collected, a warning
+# about where this link goes — and return it as prose.
+#
+# Preferred over adding actions for the same purpose. An action costs a step every
+# time the model chooses to call it and can be forgotten; an annotation is simply
+# always there. Returning "" adds nothing.
+Annotator = Callable[["Chamber", Any], Awaitable[str]]
+
 
 class Agent:
     """Drives a `Chamber` with a model until the task is done."""
@@ -101,8 +112,10 @@ class Agent:
         system_extra: str = "",
         store: TraceStore | None = None,
         orchestrator: Orchestrator | None = None,
+        annotate: Annotator | None = None,
     ) -> None:
         self.ch = chamber
+        self.annotate = annotate
         self.llm = llm
         self.on_event = on_event or (lambda _e, _p: None)
         self.store = store
@@ -284,6 +297,18 @@ class Agent:
                         ).strip()
                 plan_block = self.orchestrator.plan.render()
                 await self.ch.overlay.think(goal=self.orchestrator.plan.stage or task)
+
+            # An embedder's annotation goes in with the step's feedback, so the
+            # model reads it before the page rather than after. Guarded: a caller's
+            # bug must not end a run that is otherwise fine.
+            if self.annotate is not None:
+                try:
+                    extra = await self.annotate(self.ch, snap)
+                except Exception:
+                    log.debug("annotator raised", exc_info=True)
+                    extra = ""
+                if extra:
+                    feedback = f"{feedback}\n\n{extra}" if feedback else extra
 
             observation = prompt.observation(
                 snap, step=n, max_steps=cfg.max_steps, feedback=feedback, plan=plan_block
@@ -553,6 +578,8 @@ async def run_task(
     *,
     start_url: str | None = None,
     on_event: Listener | None = None,
+    system_extra: str = "",
+    annotate: Annotator | None = None,
 ) -> RunResult:
     """Convenience entry point: build an LLM and a trace store from config, run once."""
     import contextlib
@@ -577,6 +604,12 @@ async def run_task(
                 )
                 orchestrator = Orchestrator(planner)
             agent = Agent(
-                chamber, llm, on_event=on_event, store=store, orchestrator=orchestrator
+                chamber,
+                llm,
+                on_event=on_event,
+                store=store,
+                orchestrator=orchestrator,
+                system_extra=system_extra,
+                annotate=annotate,
             )
             return await agent.run(task, start_url=start_url)

@@ -120,13 +120,22 @@ def _action_reference() -> str:
     lines = ["# Actions"]
     groups: dict[str, list[str]] = {
         "Move around": ["navigate", "go_back", "go_forward", "reload", "scroll", "scroll_to"],
-        "Interact": ["click", "type_text", "press_key", "select_option", "hover", "drag"],
+        "Interact": ["click", "type_text", "press_key", "select_option", "hover", "drag",
+                     "upload_file"],
         "Move text between pages": ["copy", "paste", "clipboard"],
         "Tabs": ["open_tab", "switch_tab", "close_tab"],
         "Look closer": ["read_page", "screenshot", "inspect", "console_log", "network_log", "wait_for"],
+        "Get past what is in the way": ["dismiss_overlay"],
         "Escape hatches": ["evaluate_js"],
         "Stop": ["ask_human", "done"],
     }
+
+    # Anything not in a group would be silently invisible to the model even though
+    # the validator accepts it — a failure mode with no symptom except the model
+    # never using a tool it has.
+    missing = set(ACTION_TYPES) - {n for names in groups.values() for n in names}
+    if missing:  # pragma: no cover - guarded by a test
+        groups["Other"] = sorted(missing)
 
     for heading, names in groups.items():
         lines.append(f"\n**{heading}**")
