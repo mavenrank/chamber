@@ -56,6 +56,49 @@ def test_template_literals_are_balanced(path: Path):
     )
 
 
+# Not every injected script is a .js file. `detect.py` and `overlay_block.py` hold theirs as Python string constants, and those run in the page
+# exactly like the files above do — with the same silent failure when they are
+# malformed. Nothing else would catch it: the string imports fine, and a broken probe
+# just quietly reports that nothing is covering the page.
+PY_EMBEDDED = [
+    (JS_DIR / "interrupt" / "detect.py", "_DETECT_JS"),
+    (JS_DIR / "interrupt" / "overlay_block.py", "_PROBE_JS"),
+]
+
+
+def _extract(path: Path, name: str) -> str:
+    """Pull one `NAME = \"\"\"...\"\"\"` (or r-string) constant out of a module."""
+    source = path.read_text(encoding="utf-8")
+    match = re.search(
+        rf'^{re.escape(name)}\s*=\s*r?"""(.*?)"""', source, re.DOTALL | re.MULTILINE
+    )
+    assert match, f"{path.name} no longer defines {name} as a triple-quoted string"
+    return match.group(1)
+
+
+@pytest.mark.parametrize(
+    "path,name", PY_EMBEDDED, ids=lambda v: v.name if isinstance(v, Path) else v
+)
+def test_embedded_js_parses(path: Path, name: str):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not installed")
+    body = _extract(path, name)
+    # These are all bare arrow functions, which are not statements on their own.
+    # `encoding` is not optional: these probes match on "×" and "✕", and on Windows
+    # a text-mode pipe defaults to cp1252, which cannot encode either.
+    result = subprocess.run(
+        [node, "--check", "-"],
+        input=f"void ({body});",
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, f"{path.name}:{name} does not parse:\n{result.stderr}"
+
+
 def test_overlay_exposes_the_control_api():
     """The Take Control button is the one piece of UI with real consequences —
     it stops the agent. If these names drift, the Python side silently no-ops."""

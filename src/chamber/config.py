@@ -14,6 +14,8 @@ from typing import Literal
 
 from dotenv import load_dotenv
 
+from chamber.overlay import DEFAULT_SKIP_HOSTS
+
 Provider = Literal["openai", "anthropic"]
 
 load_dotenv(override=False)
@@ -90,6 +92,13 @@ class BrowserConfig:
     timezone: str | None = None
     extra_args: tuple[str, ...] = ()
     slow_mo_ms: int = 0
+    # Hosts where the on-page overlay is not injected at all. Some sites' CSP lets
+    # the bar's markup in but blocks the stylesheet that makes it a bar, leaving a
+    # line of unstyled text across the top of the page and the layout pushed down
+    # to fit it. Where that happens the honest fix is to stay off the page and let
+    # the terminal be the read-out. `CHAMBER_OVERLAY_SKIP_HOSTS` overrides it; an
+    # empty value means inject everywhere.
+    overlay_skip_hosts: tuple[str, ...] = DEFAULT_SKIP_HOSTS
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,10 +262,16 @@ class ChamberConfig:
         )
 
         exe = os.environ.get("CHAMBER_BROWSER")
+        raw_skip = os.environ.get("CHAMBER_OVERLAY_SKIP_HOSTS")
         browser = BrowserConfig(
             executable_path=Path(exe) if exe else None,
             profile=os.environ.get("CHAMBER_PROFILE", "default"),
             headless=_env_bool("CHAMBER_HEADLESS", False),
+            overlay_skip_hosts=(
+                DEFAULT_SKIP_HOSTS
+                if raw_skip is None
+                else tuple(h.strip().lower() for h in raw_skip.split(",") if h.strip())
+            ),
         )
         cfg = cls(
             browser=browser,

@@ -26,6 +26,16 @@
   "use strict";
   if (window.__chamberOverlay) return;
 
+  // Some sites are not worth decorating. A strict Content-Security-Policy can stop
+  // the shadow-root stylesheet from applying while still letting the markup in,
+  // which renders the bar as a stack of unstyled text across the top of the page —
+  // worse than no bar, because it also pushes the layout down. On a listed host the
+  // overlay does not mount at all: no shadow host, no padding on <html>, no DOM
+  // change of any kind. The terminal is the read-out there instead.
+  const skipHosts = window.__chamberSkipHosts || [];
+  const hostname = location.hostname || "";
+  if (skipHosts.some((h) => hostname === h || hostname.endsWith("." + h))) return;
+
   const ACCENT = "#0ea5e9";
   const WARN = "#fbbf24";
   const ERR = "#f87171";
