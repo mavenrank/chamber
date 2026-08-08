@@ -26,6 +26,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from playwright.async_api import (
     BrowserContext,
@@ -49,7 +50,14 @@ from chamber.config import ChamberConfig
 from chamber.dom import serialize
 from chamber.dom.model import Snapshot
 from chamber.dom.snapshot import ExtractOptions, capture
-from chamber.interrupt import Challenge, detect_challenge, hand_off
+from chamber.interrupt import (
+    Challenge,
+    ChallengeKind,
+    Nagging,
+    detect_challenge,
+    find_blocker,
+    hand_off,
+)
 from chamber.overlay import Overlay
 from chamber.overlay import install as install_overlay
 
@@ -69,6 +77,11 @@ class Tab:
     # doubles as a note to self — "amazon.in cart" is memory the model cannot lose
     # between steps, unlike anything it merely remembers.
     purpose: str = ""
+    # Which tab spawned this one. Sites that open results in a new tab, and then a
+    # third when that one links out, turn "where do I go back to" into a real
+    # question several times a run. Recording the answer beats asking the model to
+    # remember it across the twenty steps in between.
+    opened_by: str = ""
 
     @property
     def closed(self) -> bool:
@@ -111,6 +124,9 @@ class Chamber:
         # It also means copied text goes page → buffer → page without ever
         # entering the model's context: no tokens, and no transcription errors.
         self.clipboard = Clipboard()
+        # How often each host has interrupted us. Dismissing the same sign-in modal
+        # forty times is not progress, and this is what notices.
+        self.nagging = Nagging()
         # Set by the agent loop so handoffs and traces can name the goal.
         self.goal: str = ""
         # Flipped by the Take Control button in the page. The loop waits on this
@@ -150,7 +166,9 @@ class Chamber:
             # Init scripts must be installed before the first page navigates, or the
             # overlay and the readiness observer miss the load they most need to see.
             ch = cls(config, pw, context, result.build, run_id)
-            await install_overlay(context, ch._on_control)
+            await install_overlay(
+                context, ch._on_control, skip_hosts=config.browser.overlay_skip_hosts
+            )
             await ready_mod.install(context)
 
             await ch._adopt_existing()
@@ -201,14 +219,15 @@ class Chamber:
 
     # ---------------------------------------------------------------------- tabs
 
-    def _register(self, page: Page) -> Tab:
+    def _register(self, page: Page, *, opened_by: str = "") -> Tab:
         self._tab_seq += 1
         tab_id = f"t{self._tab_seq}"
         tab = Tab(
             id=tab_id,
             page=page,
-            overlay=Overlay(page),
+            overlay=Overlay(page, skip_hosts=self.config.browser.overlay_skip_hosts),
             monitor=PageMonitor(page),
+            opened_by=opened_by,
         )
         self._tabs[tab_id] = tab
         page.on("close", lambda _p, tid=tab_id: self._tabs.pop(tid, None))
@@ -218,8 +237,23 @@ class Chamber:
         """A tab the page opened itself — target=_blank, window.open, an ad."""
         if any(t.page is page for t in self._tabs.values()):
             return
-        tab = self._register(page)
-        log.info("new tab %s: %s", tab.id, page.url[:80])
+        tab = self._register(page, opened_by=self._current)
+        log.info("new tab %s (from %s): %s", tab.id, tab.opened_by or "?", page.url[:80])
+
+    def home_tab(self, tab_id: str = "") -> str:
+        """The tab this one was opened from, if it is still around.
+
+        What "go back to where I was" means when a click opened a new tab instead of
+        navigating. Falls back to the oldest surviving tab, which is reliably the
+        one the run started from.
+        """
+        tab = self._tabs.get(tab_id or self._current)
+        if tab is not None:
+            parent = self._tabs.get(tab.opened_by)
+            if parent is not None and not parent.closed:
+                return parent.id
+        live = [t for t in self._tabs.values() if not t.closed]
+        return live[0].id if live else ""
 
     def _current_tab(self) -> Tab:
         """The tab everything acts on, healing if it has gone away.
@@ -274,7 +308,8 @@ class Chamber:
                         "id": tab.id,
                         "url": tab.page.url,
                         "title": "",
-                        "purpose": tab.purpose,
+                        "purpose": tab.purpose or _implied_purpose(tab.page.url),
+                        "opened_by": tab.opened_by,
                     }
                 )
             except PWError:
@@ -282,9 +317,14 @@ class Chamber:
         return out
 
     async def open_tab(self, url: str = "about:blank", purpose: str = "") -> str:
+        opener = self._current
         page = await self._context.new_page()
-        tab = next((t for t in self._tabs.values() if t.page is page), None) or self._register(page)
+        tab = next((t for t in self._tabs.values() if t.page is page), None) or self._register(
+            page, opened_by=opener
+        )
         tab.purpose = purpose
+        if not tab.opened_by:
+            tab.opened_by = opener
         self._current = tab.id
         if url and url != "about:blank":
             await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
@@ -393,11 +433,34 @@ class Chamber:
 
         if check_challenge and not quiet:
             challenge = await detect_challenge(self.page)
+            blocker = await find_blocker(self.page)
+
+            # A dismissible nag over a working page is not a login wall, even though
+            # it contains a password field — and "sign in to keep reading" modals
+            # serve exactly that, on every page of a site, all day. Left
+            # undowngraded, `detect_challenge` hands the window to the human once
+            # per page and the run becomes a queue of pointless sign-in prompts.
+            # The page behind the modal is the evidence: if it is still there, we
+            # are being nagged, not stopped.
+            if challenge.kind is ChallengeKind.LOGIN and blocker.is_nag:
+                log.info("login prompt is a dismissible overlay; treating it as a nag")
+                challenge = Challenge(ChallengeKind.NONE)
+
             self.last_challenge = challenge if challenge.blocking else None
             if challenge.blocking:
                 notices.append(
                     f"{challenge.detail} {challenge.prompt()} "
                     "Use ask_human rather than trying to work around it."
+                )
+            elif blocker.is_nag:
+                notices.append(
+                    f"Something is in the way: {blocker.describe()}. "
+                    "Call dismiss_overlay to close it, then carry on."
+                )
+            elif blocker.is_wall:
+                notices.append(
+                    f"{blocker.describe()}. The page is not usable behind it — "
+                    "if it wants an account, ask_human with reason 'login'."
                 )
 
         snap = await capture(self.page, options, notices=notices)
@@ -555,6 +618,23 @@ class Chamber:
     async def extension_status(self) -> list[dict[str, Any]]:
         """What extensions actually loaded — worth logging once at startup."""
         return await launcher.extension_report(self._context)
+
+
+def _implied_purpose(url: str) -> str:
+    """A label for a tab nobody named.
+
+    Tabs the *page* opened never get a purpose, and on a busy run those are most of
+    them. An unnamed row in the tab list is a tab the model cannot tell apart from
+    three others, so the host stands in until something better is set — which an
+    embedder can do at any time by assigning to `Tab.purpose`.
+    """
+    try:
+        host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    except ValueError:
+        return ""
+    if not host or url.startswith("about:"):
+        return ""
+    return host
 
 
 def _explain_validation(exc: Exception) -> str:

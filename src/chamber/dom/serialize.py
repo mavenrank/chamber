@@ -119,9 +119,21 @@ def render(
             marker = "▸" if tab.get("id") == snap.tab_id else " "
             purpose = f"  ({tab['purpose']})" if tab.get("purpose") else ""
             label = tab.get("title", "")[:50] or tab.get("url", "")[:70]
-            out.append(f" {marker} [{tab.get('id')}] {label}{purpose}")
+            # Naming the opener turns "which tab were my results on?" from something
+            # the model has to have remembered into something it can read.
+            came_from = ""
+            if tab.get("opened_by") and tab.get("id") != tab.get("opened_by"):
+                came_from = f"  ← opened from {tab['opened_by']}"
+            out.append(f" {marker} [{tab.get('id')}] {label}{purpose}{came_from}")
             if tab.get("title"):
                 out.append(f"      {tab.get('url', '')[:90]}")
+
+        # A tab pool is only useful if it stays small enough to reason about.
+        if len(snap.open_tabs) >= 5:
+            out.append(
+                f"! {len(snap.open_tabs)} tabs is more than you can keep track of — "
+                "close the ones you have finished with."
+            )
 
     # --- notices ------------------------------------------------------------
     if snap.notices:
