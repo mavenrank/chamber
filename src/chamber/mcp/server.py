@@ -165,6 +165,26 @@ def build_server(config: ChamberConfig) -> tuple[MCPServer, _Holder]:
     async def select_option(ref: str, value: str) -> str:
         return await _act({"action": "select_option", "ref": ref, "value": value})
 
+    @server.tool(
+        description=(
+            "Attach files to a file input by ref. A file picker is an OS dialog and "
+            "cannot be clicked; this sets the input directly. Only use paths the "
+            "user gave you."
+        )
+    )
+    async def upload_file(ref: str, paths: list[str]) -> str:
+        return await _act({"action": "upload_file", "ref": ref, "paths": paths})
+
+    @server.tool(
+        description=(
+            "Close a modal, banner or sign-in prompt covering the page, and say "
+            "whether the page is usable again. Never clicks Sign in or Register to "
+            "make one go away."
+        )
+    )
+    async def dismiss_overlay() -> str:
+        return await _act({"action": "dismiss_overlay"})
+
     @server.tool(description="Hover an element — opens menus and tooltips.")
     async def hover(ref: str) -> str:
         return await _act({"action": "hover", "ref": ref})

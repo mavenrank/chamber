@@ -26,9 +26,12 @@ the difference between watching an agent work and watching a window twitch.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
+from urllib.parse import urlparse
 
 from playwright.async_api import Error as PWError
 from playwright.async_api import TimeoutError as PWTimeout
@@ -38,6 +41,7 @@ from chamber.actions.result import ActionResult, Outcome
 from chamber.dom import serialize
 from chamber.dom.model import Element
 from chamber.dom.snapshot import Resolved, resolve
+from chamber.interrupt.overlay_block import dismiss, find_blocker
 
 if TYPE_CHECKING:
     from chamber.session import Chamber
@@ -507,6 +511,58 @@ class Executor:
             ActionResult.success("select_option", f"selected {chosen['chosen']!r}"), repairs
         )
 
+    async def _do_upload_file(self, a: S.UploadFile) -> ActionResult:
+        """Attach files to a file input.
+
+        Existence is checked here rather than left to Playwright, because its error
+        for a missing path is a long stack-shaped message and the model needs to know
+        which path was wrong, not what threw.
+        """
+        missing = [p for p in a.paths if not Path(p).is_file()]
+        if missing:
+            return ActionResult.failure(
+                Outcome.INVALID_ACTION,
+                "upload_file",
+                "no file at: " + ", ".join(missing)
+                + ". Use a path you were given, exactly as it was given.",
+            )
+
+        found = await self._target(a.ref, "upload_file", need_point=False)
+        if isinstance(found, ActionResult):
+            return found
+        el, _, repairs = found
+        await self._narrate(el, "attach to")
+
+        # `set_input_files` needs the input itself. Sites routinely hide the real
+        # input behind a styled label, so if the ref landed on the wrapper, look
+        # inside it before giving up.
+        handle = await self.ch.page.evaluate_handle(
+            """([ref, path]) => {
+              let node = window.__chamber?.elements.get(ref);
+              if (!node || !node.isConnected) node = document.querySelector(path);
+              if (!node) return null;
+              if (node.tagName === 'INPUT' && node.type === 'file') return node;
+              return node.querySelector('input[type=file]')
+                  || node.closest('label')?.querySelector('input[type=file]')
+                  || null;
+            }""",
+            [el.ref, el.selector],
+        )
+        element = handle.as_element()
+        if element is None:
+            return ActionResult.failure(
+                Outcome.WRONG_ELEMENT,
+                "upload_file",
+                f"{serialize.describe_element(el)} is not a file input and does not "
+                "contain one. Look for a control whose role is 'file'.",
+            )
+
+        await element.set_input_files(a.paths)
+        names = ", ".join(Path(p).name for p in a.paths)
+        return self._with_repairs(
+            ActionResult.success("upload_file", f"attached {names}"), repairs
+        )
+
     # --------------------------------------------------------------- clipboard
 
     async def _do_copy(self, a: S.Copy) -> ActionResult:
@@ -652,6 +708,55 @@ class Executor:
             "clipboard",
             f"{len(self.ch.clipboard)} clip(s)",
             lines=self.ch.clipboard.summary(),
+        )
+
+    # ------------------------------------------------------- getting unstuck
+
+    async def _do_dismiss_overlay(self, a: S.DismissOverlay) -> ActionResult:
+        blocker = await find_blocker(self.ch.page)
+        if not blocker.present:
+            return ActionResult.success(
+                "dismiss_overlay",
+                "nothing is covering the page — carry on with what you were doing",
+            )
+
+        host = ""
+        with contextlib.suppress(Exception):
+            host = urlparse(self.ch.page.url).hostname or ""
+
+        # A wall is not a nag. Dismissing is the wrong tool and saying so plainly
+        # is more useful than a failed click.
+        if blocker.is_wall:
+            return ActionResult.failure(
+                Outcome.CHALLENGE,
+                "dismiss_overlay",
+                f"{blocker.describe()}. There is no content behind it, so this is a "
+                "wall rather than a nag — closing it is not the answer. Use "
+                "ask_human (reason 'login' if it wants an account).",
+            )
+
+        seen = self.ch.nagging.record(host)
+        gone, how = await dismiss(self.ch.page, blocker)
+
+        if not gone:
+            return ActionResult.failure(
+                Outcome.NOT_INTERACTABLE,
+                "dismiss_overlay",
+                f"could not close {blocker.describe()} ({how}). Try scrolling, or "
+                "ask_human if it will not go.",
+            )
+
+        # Snapshot refs were taken with the modal on top; they are stale now.
+        self.ch.last_snapshot = None
+
+        repairs: list[str] = []
+        if self.ch.nagging.escalated(host):
+            repairs.append(self.ch.nagging.advice(host))
+        elif seen > 1:
+            repairs.append(f"that is {seen} times on {host} — it will keep coming back")
+
+        return self._with_repairs(
+            ActionResult.success("dismiss_overlay", f"closed it — {how}"), repairs, repairs
         )
 
     # ------------------------------------------------------------------ scroll

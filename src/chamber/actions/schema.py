@@ -113,6 +113,27 @@ class SelectOption(_Base):
     value: str = Field(description="The visible option text, or its value attribute.")
 
 
+class UploadFile(_Base):
+    """Attach a file to a file input.
+
+    A file picker is an operating-system dialog, and nothing in the page — or in
+    Playwright's mouse — can drive one. It has to be set on the input element
+    directly, which is why this is its own action rather than something `click`
+    could ever grow into.
+
+    You may only attach paths the person running this has already provided. Do not
+    go looking through the filesystem for something plausible: attaching the wrong
+    file is not a mistake that stays on the page.
+    """
+
+    action: Literal["upload_file"] = "upload_file"
+    ref: str = Field(description="A ref whose role is 'file' — the upload control.")
+    paths: list[str] = Field(
+        min_length=1,
+        description="Absolute paths. More than one only if the input accepts multiple.",
+    )
+
+
 # ------------------------------------------------------------------ clipboard
 
 
@@ -260,6 +281,21 @@ class InspectElement(_Base):
     ref: str
 
 
+class DismissOverlay(_Base):
+    """Close a modal, banner or sign-in prompt that is covering the page.
+
+    Use it the moment something is in the way — a "sign in to continue" box, a
+    cookie wall, an app-download banner. It finds the topmost blocking layer, closes
+    it properly, and tells you whether the page is usable again.
+
+    It will not click "Sign in", "Register" or "Continue with Google" to make a
+    modal go away, and neither should you. If it reports that the same site keeps
+    re-nagging, stop dismissing and ask the human to sign in once.
+    """
+
+    action: Literal["dismiss_overlay"] = "dismiss_overlay"
+
+
 class ConsoleLog(_Base):
     action: Literal["console_log"] = "console_log"
     limit: int = Field(50, ge=1, le=500)
@@ -322,6 +358,7 @@ AnyAction = Annotated[
     | TypeText
     | PressKey
     | SelectOption
+    | UploadFile
     | Copy
     | Paste
     | Clipboard
@@ -334,6 +371,7 @@ AnyAction = Annotated[
     | ReadPage
     | Screenshot
     | InspectElement
+    | DismissOverlay
     | ConsoleLog
     | NetworkLog
     | EvaluateJS
@@ -370,7 +408,8 @@ ACTION_TYPES: dict[str, type[_Base]] = {
     cls.model_fields["action"].default: cls  # type: ignore[union-attr]
     for cls in (
         Navigate, GoBack, GoForward, Reload, Click, Hover, Drag, TypeText, PressKey,
-        SelectOption, Copy, Paste, Clipboard, Scroll, ScrollToRef, OpenTab, SwitchTab,
+        SelectOption, UploadFile, Copy, Paste, Clipboard, Scroll, ScrollToRef,
+        OpenTab, SwitchTab, DismissOverlay,
         CloseTab, WaitFor, ReadPage, Screenshot, InspectElement, ConsoleLog,
         NetworkLog, EvaluateJS, AskHuman, Done,
     )
@@ -384,6 +423,7 @@ REF_FIELDS: dict[str, tuple[str, ...]] = {
     "drag": ("from_ref", "to_ref"),
     "type_text": ("ref",),
     "select_option": ("ref",),
+    "upload_file": ("ref",),
     "copy": ("ref",),
     "paste": ("ref",),
     "scroll_to": ("ref",),
@@ -434,6 +474,7 @@ __all__ = [
     "Click",
     "CloseTab",
     "ConsoleLog",
+    "DismissOverlay",
     "Done",
     "Drag",
     "EvaluateJS",
@@ -453,6 +494,7 @@ __all__ = [
     "SelectOption",
     "SwitchTab",
     "TypeText",
+    "UploadFile",
     "ValidationError",
     "WaitFor",
     "parse_action",

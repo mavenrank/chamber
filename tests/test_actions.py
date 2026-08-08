@@ -22,6 +22,8 @@ class TestSchema:
             "type_text": {"ref": "e1", "text": "hi"},
             "press_key": {"key": "Enter"},
             "select_option": {"ref": "e1", "value": "Price"},
+            "upload_file": {"ref": "e1", "paths": ["/tmp/cv.pdf"]},
+            "dismiss_overlay": {},
             "copy": {"ref": "e1"},
             "paste": {"ref": "e1"},
             "clipboard": {},
@@ -44,6 +46,15 @@ class TestSchema:
         for name, payload in samples.items():
             action = parse_action({"action": name, **payload})
             assert action.action == name
+
+    def test_every_action_is_described_to_the_model(self):
+        """An action missing from the prompt's groups is one the model never learns
+        it has — accepted by the validator, invisible in the reference."""
+        from chamber.agent.prompt import system_prompt
+
+        reference = system_prompt(tool_calling=False)
+        for name in ACTION_TYPES:
+            assert f"`{name}`(" in reference, f"{name} is not in the action reference"
 
     def test_rejects_unknown_fields(self):
         with pytest.raises(ValidationError):
