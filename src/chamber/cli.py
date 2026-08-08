@@ -66,6 +66,23 @@ app = typer.Typer(
     rich_markup_mode="rich",
     help=_HELP,
 )
+
+def _force_utf8_output() -> None:
+    """Windows' legacy console is cp1252 and raises on anything outside it.
+
+    Applied once, for every command. It used to live inside `watch` alone, which
+    was not enough: rich falls back to its legacy Windows renderer whenever output
+    is not a real terminal — piped to a file, or through `tail` — and then a single
+    box-drawing character in a status line takes the whole run down with a
+    `UnicodeEncodeError`. Losing a finished run to a glyph is not a trade worth
+    making, so unencodable characters are replaced rather than raised.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+_force_utf8_output()
 console = Console()
 
 
@@ -533,13 +550,6 @@ def watch(
     """
     # The view owns the terminal, so ordinary logging would tear the layout apart.
     logging.basicConfig(level=logging.CRITICAL, handlers=[logging.NullHandler()])
-    # Windows' legacy console is cp1252 and raises on anything outside it. A box
-    # drawing character must never be the reason a run dies, so the stream is
-    # switched to UTF-8 and told to replace what it still cannot encode.
-    for stream in (sys.stdout, sys.stderr):
-        with contextlib.suppress(Exception):
-            stream.reconfigure(encoding="utf-8", errors="replace")
-
     overrides: dict[str, object] = {"profile": profile, "loop__max_steps": max_steps}
     if model:
         overrides["model__model"] = model
