@@ -120,6 +120,7 @@ class ChamberDesk:
             )
             self.page = await self.context.new_page()
             await self.page.expose_binding("__chamberDeskAction", self._action_binding)
+            await self.page.expose_binding("__chamberQuery", self._query_binding)
             await self.page.set_content(_app_html(), wait_until="domcontentloaded")
             await self.page.title()
             self.page.on("close", self._on_page_close)
@@ -195,6 +196,37 @@ class ChamberDesk:
                 await result
         except Exception:
             log.debug("Chamber Desk action failed", exc_info=True)
+
+    async def _query_binding(self, _source: object, query: object) -> dict[str, object]:
+        """Read-only Console queries for Phase 1. Never raises to the page.
+
+        Desk × Console contract: this binding is transport #2 for
+        `display/queries.py` (same functions as `/api/query`). It adds no
+        server dependency to Desk — the window works identically without it.
+        """
+        try:
+            from chamber.display import queries as _q
+
+            payload = query if isinstance(query, dict) else {"op": str(query)}
+            op = str(payload.get("op", ""))
+            if op == "list_runs":
+                try:
+                    limit = int(payload.get("limit", 20) or 20)
+                except (TypeError, ValueError):
+                    limit = 20
+                return {"ok": True, "runs": _q.list_runs(limit=min(max(limit, 1), 50))}
+            if op == "get_run":
+                return {"ok": True, **_q.get_run(str(payload.get("run_id", "")))}
+            if op == "list_profiles":
+                return {"ok": True, "profiles": _q.list_profiles()}
+            if op == "get_environment":
+                return {"ok": True, **_q.get_environment()}
+            if op == "get_snapshot":
+                return {"ok": True, "snapshot": self.adapter.snapshot()}
+            return {"ok": False, "error": f"unknown query op: {op}"}
+        except Exception as exc:
+            log.debug("Chamber Desk query failed", exc_info=True)
+            return {"ok": False, "error": str(exc)[:300]}
 
     def _on_page_close(self, _page: Page) -> None:
         self._closed = True

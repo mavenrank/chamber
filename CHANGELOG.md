@@ -13,6 +13,46 @@ the trace database with `chamber trace`.
 
 ---
 
+## [0.11.0] — 2026-09-20
+
+### Chamber Console: read-only sessions shell over the trace store
+
+Desk watches one live run; Console reviews every run. `chamber console`
+serves it on localhost with the built app plus a query API — finished and
+in-flight sessions, per-role model calls, sources, steps, environment and
+profiles.
+
+**Added**
+
+- **`chamber console`** — stdlib-only localhost server (`/` → console):
+  static bundle plus `/api/query`
+  (`list_runs`/`get_run`/`list_profiles`/`get_environment`), straight from
+  the WAL-mode trace store. Never binds beyond localhost.
+- **Console app** — React/Vite + Radix, Bun-managed, OS-aware light/dark
+  theme with toggle: navbar (Sessions · Live · Environment · Profiles ·
+  Models), session tabs (Overview · Sources · Steps), run search,
+  auto-refresh with connection-status button, resizable split, settings view.
+  Dashed placeholders mark every Phase 2/3 home.
+- **`display/queries.py`** — the sole history API behind all three
+  transports (direct import, Desk binding, HTTP). Redacts keys.
+- **Desk session block** — `adapter.set_session()` attaches
+  run/profile/browser/model identity once per window.
+- **Desk `__chamberQuery` binding** — history inside the Desk window with no
+  new server dependency.
+
+**Desk × Console contract** (standing decision, locked here):
+
+1. `DisplayAdapter.snapshot()` is the wire format — additive changes only.
+2. `display/queries.py` is the only history API, over all three transports.
+3. Desk stays server-free — its sole ingress is
+   `window.__chamberDesk.apply()`.
+4. Console owns URLs (`/` → console); Desk is never served over HTTP.
+
+**Verified** — 139 tests green, `ruff check` clean, live ping of the
+console routes (`/console.html`, `/api/query`) during review.
+
+---
+
 ## [0.10.0] — 2026-09-20
 
 ### A live window over the agent loop

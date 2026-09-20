@@ -129,6 +129,15 @@ class DisplayState:
     """Durable in-process state for one Chamber task."""
 
     task: str = ""
+    # Phase 1 Console block: which session this Desk window is attached to.
+    # Set once via `set_session()` from `Chamber.start_display()`; never
+    # cleared by `run_start` so a late joiner still knows the environment.
+    # Shape: {"run_id": str, "profile": str, "browser": {...}, "models": {...}}.
+    # Desk × Console contract: (1) this snapshot schema is the wire format —
+    # additive changes only; (2) `display/queries.py` is the sole history API;
+    # (3) Desk stays server-free, ingress is `apply()` only; (4) Console owns
+    # URLs (`/` → console). See CHANGELOG 0.11.0.
+    session: dict[str, object] = field(default_factory=dict)
     current: dict[str, str] = field(
         default_factory=lambda: {
             "title": "Waiting",
@@ -229,6 +238,11 @@ class DisplayAdapter:
         """Register or replace the built-in parser for one event name."""
         self._parsers[event] = parser
 
+    def set_session(self, session: Mapping[str, Any] | None) -> dict[str, object]:
+        """Attach environment identity; returned snapshot includes it."""
+        self.state.session = dict(session) if session else {}
+        return self.snapshot()
+
     def register_status_adapter(
         self,
         getter: StatusGetter,
@@ -299,6 +313,7 @@ class DisplayAdapter:
         """Return JSON-safe state for the companion window."""
         return {
             "task": self.state.task,
+            "session": dict(self.state.session),
             "current": dict(self.state.current),
             "step": self.state.step,
             "max_steps": self.state.max_steps,

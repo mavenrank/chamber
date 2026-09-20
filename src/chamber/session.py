@@ -256,6 +256,18 @@ class Chamber:
                 self.display.adapter.register_status_adapter(
                     getter, parser, prepend=prepend
                 )
+        # Phase 1 Console block (Desk × Console contract, CHANGELOG 0.11.0):
+        # attach run/profile/browser/model identity once so Desk + Console
+        # agree on which session is live. Read-only, never keys. Failures must
+        # not stop the window from opening.
+        try:
+            from chamber.display.queries import build_session_block
+
+            self.display.adapter.set_session(
+                build_session_block(self.config, self.build, self.run_id)
+            )
+        except Exception:
+            log.debug("display session block failed", exc_info=True)
         return await self.display.start()
 
     def register_display_status_adapter(

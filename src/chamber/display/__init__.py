@@ -14,6 +14,13 @@ from chamber.display.adapter import (
     StatusSignal,
     StatusUpdate,
 )
+from chamber.display.queries import (
+    build_session_block,
+    get_environment,
+    get_run,
+    list_profiles,
+    list_runs,
+)
 from chamber.display.status import EventStatusGetter, FunctionStatusParser
 from chamber.display.window import ChamberDesk
 
@@ -28,4 +35,9 @@ __all__ = [
     "StatusParser",
     "StatusSignal",
     "StatusUpdate",
+    "build_session_block",
+    "get_environment",
+    "get_run",
+    "list_profiles",
+    "list_runs",
 ]

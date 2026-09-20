@@ -862,5 +862,32 @@ async def _setup(cfg: ChamberConfig, url: str) -> None:
             console.print("\n[green]saving and closing…[/green]")
 
 
+@app.command(name="console")
+def console_(
+    port: Annotated[int, typer.Option("--port", "-p", help="Localhost port.")] = 5192,
+    host: Annotated[str, typer.Option("--host", help="Bind address. Keep this localhost.")] = "127.0.0.1",
+) -> None:
+    """Serve the read-only Chamber Console in any browser.
+
+    Desk × Console contract (CHANGELOG 0.11.0): Console owns URLs, history
+    flows only through `display/queries.py`, Desk itself is never served here.
+
+    Sessions, session detail, environment, profiles and models — straight from
+    the trace store, so in-flight runs show up too. Localhost only: this
+    exposes which profiles hold logins, so it never binds 0.0.0.0.
+    """
+    from chamber.display.server import serve
+
+    console.print(f"\n[bold]Chamber Console[/bold] → http://{host}:{port}/console.html")
+    console.print("[dim]read-only · Ctrl+C to stop[/dim]\n")
+    try:
+        serve(host, port)
+    except KeyboardInterrupt:
+        console.print("closing…")
+    except OSError as exc:
+        console.print(f"[red]could not bind {host}:{port}: {exc}[/red]")
+        raise typer.Exit(1) from None
+
+
 if __name__ == "__main__":
     app()
