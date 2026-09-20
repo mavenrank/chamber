@@ -13,6 +13,41 @@ the trace database with `chamber trace`.
 
 ---
 
+## [0.10.0] — 2026-09-20
+
+### A live window over the agent loop
+
+The browser was already visible; the run was not legible anywhere outside the
+terminal. This release adds Chamber Desk — a small companion window fed by a
+normalized event stream — and puts the loop's data flow behind it.
+
+**Added**
+
+- **Chamber Desk** (`display/`) — a 520×780 Chromium `--app` window rendering
+  a React/Vite bundle (`desk.js`/`desk.css`, inlined into `about:blank` so it
+  needs no server): current status, step counter and a grouped activity chain
+  with model exchanges, vision results and screenshots. Opens with every run;
+  closing it never ends the run.
+- **`DisplayAdapter`** — the single seam between loop/model/vision dialects
+  and the window, with pluggable `StatusGetter`/`StatusParser` pairs so a new
+  status source needs no loop or renderer change.
+- **Loop display fan-out** — `run_task` emits one ordered event chain
+  (`chamber._display_event`) to the window, terminal, MCP progress and trace
+  store; step/planner/vision roles tag every model call.
+- **Trace model exchanges** — full prompts, outputs, tool calls and provider
+  reasoning summaries per call (`chamber trace <run-id> --llm`).
+- **Official OpenAI Responses API** path beside chat-completions, with
+  `reasoning_effort`, spec-correct image encoding plus automatic fallback, and
+  tool-calling fallback to JSON-in-text when an endpoint rejects tools.
+- **Planner/vision configuration** — `CHAMBER_ORCHESTRATOR_MODEL`,
+  `CHAMBER_VISION_FALLBACK_MODEL`, `CHAMBER_DISPLAY=window`.
+- **Overlay rewrite** — top bar with prefs binding and per-host skip list
+  (`CHAMBER_OVERLAY_SKIP_HOSTS`) for pages whose CSP breaks the bar.
+- **`demos/display_fixture.py`** — deterministic Desk run with no LLM or
+  website, for inspecting the UI.
+
+---
+
 ## [0.9.0] — 2026-08-07
 
 ### Watchability and handing over

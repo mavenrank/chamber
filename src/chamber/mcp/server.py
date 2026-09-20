@@ -56,6 +56,10 @@ class _Holder:
                     thought="Connected to an external agent.",
                     status="idle",
                 )
+                self._chamber._display_event(
+                    "thought",
+                    {"text": "Connected to an external agent.", "source": "MCP"},
+                )
             return self._chamber
 
     async def close(self) -> None:
@@ -310,7 +314,16 @@ def build_server(config: ChamberConfig) -> tuple[MCPServer, _Holder]:
             goal=goal or None,
             status=status if status in ("idle", "busy", "ok", "warn", "err") else "busy",
         )
-        return "shown in the browser HUD"
+        ch._display_event(
+            "thought",
+            {
+                "text": thought,
+                "goal": goal,
+                "status": status,
+                "source": "MCP",
+            },
+        )
+        return "shown in Chamber Desk (and the retained browser HUD when enabled)"
 
     @server.tool(description="Browser, profile, extensions and current page — a one-shot status check.")
     async def status() -> str:

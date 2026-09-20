@@ -6,9 +6,9 @@ case it matters. Three things happen, in order:
 1. **Surface the tab.** `bring_to_front()` plus a window-level focus. If the person
    is looking at another application entirely, an unfocused tab quietly waiting is
    the same as no prompt at all.
-2. **Say what is needed, in the page.** A full-width banner on the page itself,
-   plus a border around the viewport. Console output is easy to miss; the browser
-   window is what they are already looking at.
+2. **Say what is needed, in the page.** The corner activity panel expands with a
+   focused attention block. Console output is easy to miss; the browser window is
+   what the person is already looking at.
 3. **Watch for the condition to clear.** Polling, not a keypress. Requiring the
    human to come back and press Enter in a terminal doubles the interruption; if
    they solved the captcha, the agent should just notice and carry on.

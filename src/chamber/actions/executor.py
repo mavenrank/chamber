@@ -175,7 +175,7 @@ class Executor:
             # One re-observation, then one more attempt. A single re-render between
             # observation and action is routine on a live app and should cost the
             # model nothing.
-            await self.ch.observe(quiet=True)
+            await self.ch.observe(quiet=True, display_event=False)
             snap = self.ch.last_snapshot
             el2 = snap.get(ref) if snap else None
             if el2 is not None:

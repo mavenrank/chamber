@@ -48,6 +48,7 @@ A headed browser an LLM can drive in the open.
 
   chamber trace                           list past runs
   chamber trace <run-id>                  the full tree: steps, actions, sources
+  chamber trace <run-id> --llm            full prompts, outputs and tool calls
   chamber see <url> --ask "is it broken?" screenshot and have the vision model look
 
 [bold]Housekeeping[/bold]
@@ -741,6 +742,13 @@ def profiles(
 def trace(
     run_id: Annotated[str, typer.Argument(help="Run id. Omit to list recent runs.")] = "",
     sources: Annotated[bool, typer.Option("--sources", help="Just the source list.")] = False,
+    llm: Annotated[
+        bool,
+        typer.Option(
+            "--llm",
+            help="Full model prompts, returned output, tool calls and API reasoning summaries.",
+        ),
+    ] = False,
 ) -> None:
     """Show what a past run actually did, step by step, with its sources."""
     from chamber.trace.store import open_store
@@ -772,6 +780,10 @@ def trace(
             for s in found:
                 star = "[yellow]★[/yellow]" if s["used"] else " "
                 console.print(f"{star} {s['canonical']}  [dim]{s['title'] or ''}[/dim]")
+            return
+
+        if llm:
+            console.print(store.model_transcript(run_id), markup=False)
             return
 
         console.print(store.timeline(run_id))

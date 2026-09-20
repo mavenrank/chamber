@@ -1,54 +1,47 @@
 /**
- * chamber — the visible layer.
+ * Chamber's on-page instrument panel.
  *
- * A bar across the top of every page carrying the agent's running commentary, a
- * synthetic cursor, element highlights, and a **Take Control** button that stops
- * the agent dead and hands the browser back.
- *
- * Constraints that shaped this:
- *
- *  - **The real mouse is never touched.** Playwright's mouse and CDP's Input
- *    domain synthesize events inside the browser; the OS pointer does not move and
- *    the user keeps their machine. The dot is a read-out of where synthetic events
- *    are being sent, not a driver.
- *
- *  - **Nothing here may intercept a click** — except the one control that is meant
- *    to. The bar is `pointer-events: none` throughout; only the Take Control
- *    button re-enables them. Every node carries `data-chamber-overlay` so
- *    extraction and occlusion checks skip it, and the agent can neither see nor
- *    click its own furniture.
- *
- *  - **The bar pushes the page down rather than covering it.** Overlaying would
- *    hide the top of every site from the person watching, which is the one thing
- *    this is supposed to prevent.
+ * The panel never changes the host page's layout. Only its controls and resize
+ * grip accept pointer input, so the rest of the card does not create a dead
+ * rectangle over the page. The marked host is ignored by Chamber's extraction.
  */
 (() => {
   "use strict";
   if (window.__chamberOverlay) return;
 
-  // Some sites are not worth decorating. A strict Content-Security-Policy can stop
-  // the shadow-root stylesheet from applying while still letting the markup in,
-  // which renders the bar as a stack of unstyled text across the top of the page —
-  // worse than no bar, because it also pushes the layout down. On a listed host the
-  // overlay does not mount at all: no shadow host, no padding on <html>, no DOM
-  // change of any kind. The terminal is the read-out there instead.
   const skipHosts = window.__chamberSkipHosts || [];
   const hostname = location.hostname || "";
   if (skipHosts.some((h) => hostname === h || hostname.endsWith("." + h))) return;
 
-  const ACCENT = "#0ea5e9";
-  const WARN = "#fbbf24";
-  const ERR = "#f87171";
-  const OK = "#4ade80";
-  const BAR_H = 46;
+  const ACCENT = "#a78bfa";
+  const WARN = "#f6c453";
+  const ERR = "#fb7185";
+  const OK = "#6ee7b7";
+  const MIN_W = 260;
+  const MIN_H = 188;
+  // Chamber Desk owns the status read-out in window mode. Keep this overlay
+  // mounted for the synthetic cursor, highlights, and handoff control API, but
+  // hide the old panel until it is intentionally re-enabled with CHAMBER_DISPLAY=page.
+  const panelEnabled = window.__chamberOverlayPanel !== false;
 
   const state = {
     x: window.innerWidth / 2,
     y: window.innerHeight / 2,
     mounted: false,
     anim: null,
-    controlled: false, // true while the human has taken over
+    controlled: false,
+    visible: true,
+    expanded: false,
+    corner: "bottom-right",
+    view: "activity",
+    width: 360,
+    height: 230,
+    status: "idle",
+    step: "",
+    goal: "",
+    current: { tag: "ready", text: "Waiting for a task.", kind: "" },
     feed: [],
+    attention: null,
   };
 
   let host, shade, cursor, ripple, halo, els;
@@ -56,422 +49,333 @@
   function css() {
     return `
       :host { all: initial; }
+      * { box-sizing: border-box; }
+      button, select { font: inherit; }
       .layer {
-        position: fixed; inset: 0; pointer-events: none;
-        z-index: 2147483647;
-        font: 12px/1.5 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
+        position: fixed; inset: 0; z-index: 2147483647; pointer-events: none;
+        color: #f4f1fb;
+        font: 12px/1.45 "Segoe UI Variable Text", "Aptos", "Segoe UI", sans-serif;
         -webkit-font-smoothing: antialiased;
       }
+      .panel {
+        position: fixed; width: ${state.width}px; min-width: ${MIN_W}px;
+        max-width: min(680px, calc(100vw - 24px));
+        border: 1px solid rgba(255,255,255,.13); border-radius: 16px;
+        background: rgba(18,16,24,.88);
+        box-shadow: 0 18px 60px rgba(4,3,8,.38), 0 2px 12px rgba(4,3,8,.28);
+        backdrop-filter: blur(18px) saturate(125%);
+        -webkit-backdrop-filter: blur(18px) saturate(125%);
+        overflow: hidden; pointer-events: none;
+        transition: opacity .18s ease, transform .18s ease, border-color .18s ease;
+      }
+      .panel.bottom-right { right: 12px; bottom: 12px; }
+      .panel.bottom-left { left: 12px; bottom: 12px; }
+      .panel.top-right { right: 12px; top: 12px; }
+      .panel.top-left { left: 12px; top: 12px; }
+      .panel.hidden { opacity: 0; transform: translateY(8px); visibility: hidden; }
+      .panel.controlled { border-color: color-mix(in srgb, ${WARN} 64%, transparent); }
 
-      /* ---------------------------------------------------------- the bar */
-      .bar {
-        position: fixed; top: 0; left: 0; right: 0; height: ${BAR_H}px;
-        display: flex; align-items: stretch; gap: 0;
-        background: #0b1016; color: #e6edf3;
-        border-bottom: 1px solid rgba(255,255,255,.10);
-        pointer-events: none;
-        transition: background .25s ease;
+      .compact {
+        min-height: 68px; display: grid; grid-template-columns: minmax(0,1fr) auto;
+        align-items: center; gap: 10px; padding: 12px 12px 12px 15px;
       }
-      .bar.controlled { background: #3b2f07; border-bottom-color: ${WARN}; }
+      .message { min-width: 0; }
+      .meta { display: flex; align-items: center; gap: 7px; min-height: 17px;
+              color: #9992a8; font: 600 10px/1.2 "Cascadia Mono", "SFMono-Regular", monospace;
+              letter-spacing: .04em; text-transform: uppercase; }
+      .tag { color: #c4b5fd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .step { color: #7f788c; white-space: nowrap; }
+      .live-text {
+        display: block; margin-top: 4px; max-width: 100%; min-height: 19px;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        color: #f6f2ff; font-size: 13px; font-weight: 540; letter-spacing: -.005em;
+      }
+      .panel.busy .live-text {
+        color: transparent;
+        background: linear-gradient(100deg,#a8a1b7 18%,#fff 42%,#d8caff 55%,#a8a1b7 78%);
+        background-size: 230% 100%; background-position: 120% 0;
+        -webkit-background-clip: text; background-clip: text;
+        animation: chamber-shimmer 1.8s linear infinite;
+      }
+      .panel.warn .tag { color: ${WARN}; }
+      .panel.err .tag { color: ${ERR}; }
+      .panel.ok .tag { color: ${OK}; }
+      @keyframes chamber-shimmer { to { background-position: -110% 0; } }
 
-      .brand {
-        display: flex; align-items: center; gap: 8px;
-        padding: 0 14px; flex: none; border-right: 1px solid rgba(255,255,255,.08);
+      .controls { display: flex; align-items: center; gap: 5px; pointer-events: auto; }
+      .icon-btn, .control-btn, .view-btn, .corner-select {
+        all: unset; box-sizing: border-box; cursor: pointer; user-select: none;
+        border: 1px solid rgba(255,255,255,.11); background: rgba(255,255,255,.055);
+        color: #d8d2e2; transition: background .14s ease, border-color .14s ease, transform .1s ease;
       }
-      .dot { width: 8px; height: 8px; border-radius: 50%; background: ${ACCENT}; flex: none; }
-      @keyframes chamber-pulse { 0%,100% { opacity: 1 } 50% { opacity: .2 } }
-      .dot.busy { animation: chamber-pulse 1.05s ease-in-out infinite; }
-      .dot.warn { background: ${WARN}; }
-      .dot.err  { background: ${ERR}; }
-      .dot.ok   { background: ${OK}; }
-      .name { font-weight: 700; letter-spacing: .11em; font-size: 10px;
-              text-transform: uppercase; color: ${ACCENT}; }
-      .bar.controlled .name { color: ${WARN}; }
-      .step { font-variant-numeric: tabular-nums; color: #7d8b99; font-size: 10.5px; }
+      .icon-btn { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 9px; }
+      .icon-btn:hover, .view-btn:hover, .corner-select:hover { background: rgba(255,255,255,.11); }
+      .icon-btn:active, .control-btn:active, .view-btn:active { transform: scale(.96); }
+      .icon-btn:focus-visible, .control-btn:focus-visible, .view-btn:focus-visible,
+      .corner-select:focus-visible { outline: 2px solid ${ACCENT}; outline-offset: 2px; }
+      .chevron { transition: transform .18s ease; }
+      .panel.expanded .chevron { transform: rotate(180deg); }
 
-      /* goal, then the scrolling feed */
-      .middle { flex: 1; min-width: 0; display: flex; align-items: center;
-                gap: 14px; padding: 0 14px; overflow: hidden; }
-      .goal { flex: none; max-width: 26%; font-size: 11px; color: #7d8b99;
-              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .details {
+        display: none; height: ${Math.max(state.height - 68, 120)}px; min-height: 120px;
+        border-top: 1px solid rgba(255,255,255,.09); pointer-events: none;
+      }
+      .panel.expanded .details { display: flex; flex-direction: column; }
+      .toolbar {
+        display: flex; align-items: center; gap: 6px; padding: 9px 10px;
+        border-bottom: 1px solid rgba(255,255,255,.07); pointer-events: auto;
+      }
+      .views { display: flex; gap: 4px; flex: 1; }
+      .view-btn { padding: 5px 8px; border-radius: 8px; border-color: transparent;
+                  color: #9992a8; font-size: 11px; }
+      .view-btn.active { color: #f5f1fb; background: rgba(167,139,250,.14);
+                         border-color: rgba(167,139,250,.2); }
+      .corner-select { height: 28px; padding: 0 8px; border-radius: 8px; color: #b6afc1; font-size: 11px; }
+      .corner-select option { background: #17141d; color: #f4f1fb; }
+      .body { flex: 1; min-height: 0; overflow: auto; padding: 11px 12px 18px; pointer-events: auto;
+              scrollbar-width: thin; scrollbar-color: #4c4558 transparent; }
+      .section { display: none; }
+      .section.active { display: block; }
+      .label { color: #777080; margin-bottom: 5px; font: 600 9px/1.2 "Cascadia Mono", monospace;
+               letter-spacing: .08em; text-transform: uppercase; }
+      .goal { color: #e8e2ed; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+      .attention { display: none; margin-bottom: 11px; padding: 10px 11px; border-radius: 10px;
+                   border: 1px solid rgba(246,196,83,.28); background: rgba(246,196,83,.1); }
+      .attention.on { display: block; }
+      .attention-head { color: #ffe7a6; font-weight: 680; }
+      .attention-sub { margin-top: 3px; color: #c9b989; font-size: 11px; white-space: pre-wrap; }
+      .history { display: grid; gap: 9px; }
+      .history-row { display: grid; grid-template-columns: 66px minmax(0,1fr); gap: 9px; }
+      .history-tag { color: #827b8e; font: 600 9px/1.5 "Cascadia Mono", monospace;
+                     text-transform: uppercase; overflow: hidden; text-overflow: ellipsis; }
+      .history-text { color: #d0cad7; overflow-wrap: anywhere; }
+      .empty { color: #746d7d; }
+      .control-row { display: flex; align-items: center; gap: 9px; }
+      .control-btn { padding: 7px 10px; border-radius: 9px; color: #111015;
+                     background: #e9e2f3; border-color: transparent; font-size: 11px; font-weight: 700; }
+      .panel.controlled .control-btn { background: ${WARN}; color: #241b08; }
+      .control-copy { color: #8c8597; font-size: 11px; }
 
-      .feed { flex: 1; min-width: 0; height: 100%; position: relative; overflow: hidden; }
-      .feed-inner {
-        position: absolute; left: 0; right: 0; bottom: 0;
-        display: flex; flex-direction: column; justify-content: flex-end;
-        transition: transform .3s cubic-bezier(.2,.8,.2,1);
-      }
-      .line {
-        height: 22px; line-height: 22px; font-size: 12px;
-        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-        opacity: .35; transition: opacity .3s ease;
-      }
-      .line:last-child { opacity: 1; }
-      .line .tag {
-        display: inline-block; min-width: 62px; font-size: 9.5px;
-        text-transform: uppercase; letter-spacing: .07em; color: #55636f;
-      }
-      .line.act .tag { color: ${OK}; }
-      .line.err .tag { color: ${ERR}; }
-      .line.think .tag { color: ${ACCENT}; }
-      .line.plan .tag { color: #818cf8; }
-      .line.eye .tag { color: #e879f9; }
-      .line.err { color: #fca5a5; }
+      .resize { position: absolute; width: 20px; height: 20px; bottom: 0; cursor: nwse-resize;
+                pointer-events: auto; opacity: .6; }
+      .bottom-right .resize, .top-right .resize { right: 0; }
+      .bottom-left .resize, .top-left .resize { left: 0; cursor: nesw-resize; }
+      .resize::after { content: ""; position: absolute; right: 4px; bottom: 4px; width: 7px; height: 7px;
+                       border-right: 1px solid #8c8499; border-bottom: 1px solid #8c8499; }
+      .bottom-left .resize::after, .top-left .resize::after { right: auto; left: 4px; transform: rotate(90deg); }
 
-      /* --------------------------------------------------- take control */
-      .control {
-        flex: none; display: flex; align-items: center; padding: 0 14px;
-        border-left: 1px solid rgba(255,255,255,.08);
-        pointer-events: auto;   /* the one thing here that is clickable */
-      }
-      .btn {
-        all: unset; cursor: pointer; user-select: none;
-        display: flex; align-items: center; gap: 7px;
-        padding: 7px 14px; border-radius: 8px;
-        background: ${ACCENT}; color: #04252b;
-        font-weight: 680; font-size: 12px; white-space: nowrap;
-        transition: background .15s ease, transform .1s ease;
-      }
-      .btn:hover { background: #38bdf8; }
-      .btn:active { transform: scale(.97); }
-      .bar.controlled .btn { background: ${WARN}; color: #241a00; }
-      .bar.controlled .btn:hover { background: #fcd34d; }
-
-      /* -------------------------------------------------------- cursor */
-      .cursor {
-        position: fixed; left: 0; top: 0; width: 24px; height: 24px;
-        will-change: transform; transform: translate(-4px, -4px);
-        transition: opacity .18s ease;
-      }
-      .cursor svg { display: block; }
+      .cursor { position: fixed; left: 0; top: 0; width: 24px; height: 24px;
+                will-change: transform; transition: opacity .18s ease; }
       .cursor.hidden { opacity: 0; }
-      .halo {
-        position: fixed; left: 0; top: 0; border: 2px solid ${ACCENT};
-        border-radius: 6px; background: ${ACCENT}14;
-        opacity: 0; transition: opacity .15s ease, transform .18s cubic-bezier(.2,.8,.2,1);
-      }
+      .cursor svg { display: block; }
+      .halo { position: fixed; left: 0; top: 0; border: 2px solid ${ACCENT}; border-radius: 7px;
+              background: color-mix(in srgb, ${ACCENT} 8%, transparent); opacity: 0;
+              transition: opacity .15s ease, transform .18s cubic-bezier(.2,.8,.2,1); }
       .halo.on { opacity: 1; }
-      .halo-tag {
-        position: absolute; left: -2px; top: -22px; padding: 1px 7px;
-        background: ${ACCENT}; color: #fff; border-radius: 4px;
-        font-weight: 650; font-size: 11px; white-space: nowrap;
-        max-width: 320px; overflow: hidden; text-overflow: ellipsis;
-      }
-      .ripple {
-        position: fixed; left: 0; top: 0; width: 42px; height: 42px; margin: -21px 0 0 -21px;
-        border-radius: 50%; border: 2.5px solid ${ACCENT};
-        background: ${ACCENT}2b; opacity: 0;
-      }
-      @keyframes chamber-ripple {
-        0%   { transform: scale(.35); opacity: 1; }
-        100% { transform: scale(2.3); opacity: 0; }
-      }
+      .halo-tag { position: absolute; left: -2px; top: -23px; padding: 2px 7px; max-width: 320px;
+                  border-radius: 6px; color: #17121f; background: #d8c8ff; font-weight: 680;
+                  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .ripple { position: fixed; left: 0; top: 0; width: 42px; height: 42px; margin: -21px 0 0 -21px;
+                border: 2px solid ${ACCENT}; border-radius: 50%; opacity: 0; }
+      @keyframes chamber-ripple { from { transform: scale(.35); opacity: 1; }
+                                  to { transform: scale(2.2); opacity: 0; } }
       .ripple.go { animation: chamber-ripple .45s cubic-bezier(.2,.7,.3,1) forwards; }
+      .restore {
+        position: fixed; right: 12px; bottom: 12px; display: none; width: 32px; height: 32px;
+        place-items: center; pointer-events: auto; cursor: pointer; border-radius: 10px;
+        border: 1px solid rgba(255,255,255,.13); background: rgba(18,16,24,.88); color: #ddd5e7;
+        box-shadow: 0 8px 24px rgba(4,3,8,.3);
+      }
+      .panel.hidden + .restore { display: grid; }
 
-      /* ------------------------------------------------- handing over */
-      .banner {
-        position: fixed; left: 0; right: 0; top: ${BAR_H}px; padding: 15px 22px;
-        background: linear-gradient(180deg, ${WARN}, #f0a020);
-        color: #221800; font-weight: 620; font-size: 14.5px;
-        box-shadow: 0 6px 26px rgba(0,0,0,.4);
-        display: flex; align-items: center; gap: 13px;
-        /* Hidden with visibility, not by transform alone: a percentage translate
-           is relative to the banner's own height, so a taller banner never fully
-           clears the viewport and bleeds a stripe under the bar. Caught in a
-           screenshot with ~24px of amber over the top bar and no banner showing.
-           NB: this whole block is a JS template literal, so no backticks here. */
-        visibility: hidden;
-        transform: translateY(-100%); transition: transform .32s cubic-bezier(.2,.9,.3,1);
+      @media (max-width: 520px) {
+        .panel { max-width: calc(100vw - 16px); }
+        .panel.bottom-right, .panel.top-right { right: 8px; }
+        .panel.bottom-left, .panel.top-left { left: 8px; }
+        .panel.bottom-right, .panel.bottom-left { bottom: 8px; }
+        .panel.top-right, .panel.top-left { top: 8px; }
+        .live-text { font-size: 12px; }
       }
-      .banner.on { visibility: visible; transform: translateY(0); }
-      .banner .big { font-size: 20px; }
-      .banner .sub { font-weight: 450; opacity: .82; font-size: 12.5px; margin-top: 2px; }
-      .edge {
-        position: fixed; inset: ${BAR_H}px 0 0 0; border: 3px solid ${WARN};
-        opacity: 0; transition: opacity .3s ease;
+      @media (prefers-reduced-motion: reduce) {
+        .panel, .chevron, .halo { transition: none; }
+        .panel.busy .live-text { animation: none; color: #f6f2ff; background: none; }
+        .ripple.go { animation: none; }
       }
-      .edge.on { opacity: 1; }
     `;
   }
 
-  // Lucide `mouse-pointer-2` (ISC). Filled with a thin white outline: the outline
-  // is what keeps the pointer legible over a dark hero image or a blue button.
-  // Its tip sits at ~(4,4) in the 24-unit box, hence the -4px offset.
   const CURSOR_SVG = `
     <svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
       <path d="M4.037 4.688a.495.495 0 0 1 .651-.651l16 6.5a.5.5 0 0 1-.063.947l-6.124 1.58a2 2 0 0 0-1.438 1.435l-1.579 6.126a.5.5 0 0 1-.947.063z"
-            fill="${ACCENT}" stroke="#ffffff" stroke-width="1.4"
-            stroke-linecap="round" stroke-linejoin="round"/>
+            fill="${ACCENT}" stroke="#fff" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
     </svg>`;
-
-  /**
-   * Make room for the bar instead of covering the page with it.
-   *
-   * Re-applied on mount because SPA route changes and `document.write` can reset
-   * inline styles on the root element.
-   */
-  function reserveSpace() {
-    const root = document.documentElement;
-    if (root.style.getPropertyValue("--chamber-bar") !== `${BAR_H}px`) {
-      root.style.setProperty("--chamber-bar", `${BAR_H}px`);
-      root.style.setProperty("padding-top", `${BAR_H}px`, "important");
-      root.style.setProperty("box-sizing", "border-box", "important");
-    }
-  }
+  const EXPAND_ICON = `<svg class="chevron" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>`;
+  const EYE_ICON = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2.1 12a10.5 10.5 0 0 1 19.8 0 10.5 10.5 0 0 1-19.8 0Z"/><circle cx="12" cy="12" r="3"/></svg>`;
 
   function mount() {
     if (state.mounted || !document.body) return;
-
     host = document.createElement("div");
     host.setAttribute("data-chamber-overlay", "root");
     host.style.cssText = "all:initial;position:fixed;z-index:2147483647;";
     const root = host.attachShadow({ mode: "open" });
-
     const style = document.createElement("style");
     style.textContent = css();
     root.appendChild(style);
-
     shade = document.createElement("div");
     shade.className = "layer";
     shade.innerHTML = `
-      <div class="bar">
-        <div class="brand">
-          <div class="dot"></div>
-          <div>
-            <div class="name">chamber</div>
-            <div class="step"></div>
+      <aside class="panel bottom-right" aria-label="Agent activity" aria-live="polite">
+        <div class="compact">
+          <div class="message"><div class="meta"><span class="tag"></span><span class="step"></span></div><span class="live-text"></span></div>
+          <div class="controls">
+            <button class="icon-btn visibility" type="button" aria-label="Hide activity panel" title="Hide panel">${EYE_ICON}</button>
+            <button class="icon-btn expand" type="button" aria-label="Show details" aria-expanded="false" title="Show details">${EXPAND_ICON}</button>
           </div>
         </div>
-        <div class="middle">
-          <div class="goal"></div>
-          <div class="feed"><div class="feed-inner"></div></div>
+        <div class="details">
+          <div class="toolbar">
+            <div class="views"><button class="view-btn active" type="button" data-view="activity">Activity</button><button class="view-btn" type="button" data-view="goal">Goal</button><button class="view-btn" type="button" data-view="history">History</button></div>
+            <select class="corner-select" aria-label="Panel position" title="Panel position"><option value="bottom-right">Bottom right</option><option value="bottom-left">Bottom left</option><option value="top-right">Top right</option><option value="top-left">Top left</option></select>
+          </div>
+          <div class="body">
+            <section class="section activity active">
+              <div class="attention"><div class="attention-head"></div><div class="attention-sub"></div></div>
+              <div class="label">Current</div><div class="current-detail"></div>
+              <div class="control-row" style="margin-top:13px"><button class="control-btn" type="button">Take control</button><span class="control-copy">The agent pauses before its next step.</span></div>
+            </section>
+            <section class="section goal-section"><div class="label">Current goal</div><div class="goal"></div></section>
+            <section class="section history-section"><div class="history"></div></section>
+          </div>
         </div>
-        <div class="control">
-          <button class="btn" type="button">
-            <span class="btn-icon">&#9995;</span><span class="btn-label">Take control</span>
-          </button>
-        </div>
-      </div>
-      <div class="edge"></div>
-      <div class="halo"><div class="halo-tag"></div></div>
-      <div class="ripple"></div>
-      <div class="cursor">${CURSOR_SVG}</div>
-      <div class="banner">
-        <div class="big">&#128075;</div>
-        <div>
-          <div class="head">Your turn</div>
-          <div class="sub"></div>
-        </div>
-      </div>`;
+        <div class="resize" role="separator" aria-label="Resize activity panel"></div>
+      </aside>
+      <button class="restore" type="button" aria-label="Show activity panel" title="Show activity">${EYE_ICON}</button>
+      <div class="halo"><div class="halo-tag"></div></div><div class="ripple"></div><div class="cursor">${CURSOR_SVG}</div>`;
     root.appendChild(shade);
     document.documentElement.appendChild(host);
-
     els = {
-      bar: shade.querySelector(".bar"),
-      dot: shade.querySelector(".dot"),
-      step: shade.querySelector(".step"),
-      goal: shade.querySelector(".goal"),
-      feed: shade.querySelector(".feed-inner"),
-      btn: shade.querySelector(".btn"),
-      btnLabel: shade.querySelector(".btn-label"),
-      btnIcon: shade.querySelector(".btn-icon"),
-      cursor: shade.querySelector(".cursor"),
-      ripple: shade.querySelector(".ripple"),
-      halo: shade.querySelector(".halo"),
-      haloTag: shade.querySelector(".halo-tag"),
-      banner: shade.querySelector(".banner"),
-      bannerHead: shade.querySelector(".banner .head"),
-      bannerSub: shade.querySelector(".banner .sub"),
-      edge: shade.querySelector(".edge"),
+      panel: shade.querySelector(".panel"), tag: shade.querySelector(".tag"), step: shade.querySelector(".step"), liveText: shade.querySelector(".live-text"),
+      expand: shade.querySelector(".expand"), visibility: shade.querySelector(".visibility"), restore: shade.querySelector(".restore"), details: shade.querySelector(".details"),
+      viewButtons: [...shade.querySelectorAll(".view-btn")], sections: [...shade.querySelectorAll(".section")], corner: shade.querySelector(".corner-select"),
+      goal: shade.querySelector(".goal"), history: shade.querySelector(".history"), current: shade.querySelector(".current-detail"), control: shade.querySelector(".control-btn"),
+      controlCopy: shade.querySelector(".control-copy"), attention: shade.querySelector(".attention"), attentionHead: shade.querySelector(".attention-head"),
+      attentionSub: shade.querySelector(".attention-sub"), resize: shade.querySelector(".resize"), cursor: shade.querySelector(".cursor"),
+      ripple: shade.querySelector(".ripple"), halo: shade.querySelector(".halo"), haloTag: shade.querySelector(".halo-tag"),
     };
-    cursor = els.cursor;
-    ripple = els.ripple;
-    halo = els.halo;
-
-    els.btn.addEventListener("click", () => api.toggleControl());
-
-    reserveSpace();
-    paintCursor();
-    renderFeed();
-    state.mounted = true;
-
-    // A page that rewrites <body> (SPA route swaps, document.write) can detach us
-    // and reset the root padding. Cheaper and more reliable than a MutationObserver
-    // over the whole document.
-    setInterval(() => {
-      if (!document.documentElement.contains(host)) {
-        try { document.documentElement.appendChild(host); } catch {}
+    cursor = els.cursor; ripple = els.ripple; halo = els.halo;
+    if (!panelEnabled) {
+      els.panel.style.display = "none";
+      els.panel.hidden = true;
+      els.panel.setAttribute("aria-hidden", "true");
+      els.restore.style.display = "none";
+      els.restore.hidden = true;
+      els.restore.setAttribute("aria-hidden", "true");
+    }
+    els.expand.addEventListener("click", () => { setExpanded(!state.expanded); savePrefs(); });
+    els.visibility.addEventListener("click", () => api.hud(false));
+    els.restore.addEventListener("click", () => api.hud(true));
+    els.control.addEventListener("click", () => api.toggleControl());
+    els.corner.addEventListener("change", () => { setCorner(els.corner.value); savePrefs(); });
+    for (const button of els.viewButtons) button.addEventListener("click", () => { setView(button.dataset.view); savePrefs(); });
+    installResize(); render(); paintCursor(); state.mounted = true;
+    try {
+      if (window.__chamberOverlayPrefs) {
+        Promise.resolve(window.__chamberOverlayPrefs()).then((prefs) => api.configure(prefs || {})).catch(() => {});
       }
-      reserveSpace();
-    }, 1000);
+    } catch {}
+    setInterval(() => { if (!document.documentElement.contains(host)) { try { document.documentElement.appendChild(host); } catch {} } }, 1000);
   }
 
-  function paintCursor() {
-    if (cursor) cursor.style.transform = `translate(${state.x - 2}px, ${state.y - 2}px)`;
+  function installResize() {
+    els.resize.addEventListener("pointerdown", (event) => {
+      event.preventDefault(); els.resize.setPointerCapture(event.pointerId);
+      const startX = event.clientX, startY = event.clientY, startW = state.width, startH = state.height;
+      const left = state.corner.endsWith("left"), top = state.corner.startsWith("top");
+      const move = (e) => {
+        const dx = (e.clientX - startX) * (left ? -1 : 1);
+        const dy = (e.clientY - startY) * (top ? 1 : -1);
+        state.width = Math.max(MIN_W, Math.min(window.innerWidth - 24, startW + dx));
+        state.height = Math.max(MIN_H, Math.min(window.innerHeight - 24, startH + dy));
+        els.panel.style.width = state.width + "px";
+        els.details.style.height = Math.max(state.height - 68, 120) + "px";
+      };
+      const up = () => { els.resize.removeEventListener("pointermove", move); els.resize.removeEventListener("pointerup", up); savePrefs(); };
+      els.resize.addEventListener("pointermove", move); els.resize.addEventListener("pointerup", up);
+    });
   }
 
-  function renderFeed() {
-    if (!els) return;
-    els.feed.innerHTML = "";
-    // Only the last few matter; the terminal view keeps the full transcript.
-    for (const item of state.feed.slice(-4)) {
-      const row = document.createElement("div");
-      row.className = `line ${item.kind || ""}`;
-      const tag = document.createElement("span");
-      tag.className = "tag";
-      tag.textContent = item.tag || "";
-      row.appendChild(tag);
-      row.appendChild(document.createTextNode(item.text || ""));
-      els.feed.appendChild(row);
+  function setExpanded(value) {
+    state.expanded = !!value; els.panel.classList.toggle("expanded", state.expanded);
+    els.expand.setAttribute("aria-expanded", String(state.expanded));
+    els.expand.setAttribute("aria-label", state.expanded ? "Hide details" : "Show details");
+  }
+  function setView(view) {
+    if (!["activity","goal","history"].includes(view)) return;
+    state.view = view; els.viewButtons.forEach((b) => b.classList.toggle("active", b.dataset.view === view));
+    const target = view === "goal" ? "goal-section" : view === "history" ? "history-section" : "activity";
+    els.sections.forEach((s) => s.classList.toggle("active", s.classList.contains(target)));
+  }
+  function setCorner(corner) {
+    if (!["bottom-right","bottom-left","top-right","top-left"].includes(corner)) return;
+    state.corner = corner; els.panel.classList.remove("bottom-right","bottom-left","top-right","top-left");
+    els.panel.classList.add(corner); els.corner.value = corner;
+  }
+  function savePrefs() {
+    try {
+      if (window.__chamberOverlayPrefs) {
+        window.__chamberOverlayPrefs({corner:state.corner,view:state.view,expanded:state.expanded,width:Math.round(state.width),height:Math.round(state.height),visible:state.visible});
+      }
+    } catch {}
+  }
+  function renderHistory() {
+    els.history.innerHTML = "";
+    if (!state.feed.length) { const empty = document.createElement("div"); empty.className = "empty"; empty.textContent = "No activity yet."; els.history.appendChild(empty); return; }
+    for (const item of [...state.feed].reverse()) {
+      const row = document.createElement("div"); row.className = "history-row";
+      const tag = document.createElement("div"); tag.className = "history-tag"; tag.textContent = item.tag || "event";
+      const text = document.createElement("div"); text.className = "history-text"; text.textContent = item.text || "";
+      row.append(tag,text); els.history.appendChild(row);
     }
   }
-
-  // --------------------------------------------------------------- public API
+  function render() {
+    if (!els) return;
+    const item = state.current;
+    els.tag.textContent = state.controlled ? "your control" : (item.tag || "activity");
+    els.step.textContent = state.step ? `\u00b7 ${state.step}` : "";
+    els.liveText.textContent = state.controlled ? "Agent paused. Use the browser normally." : (item.text || "Waiting.");
+    els.current.textContent = item.text || "Waiting."; els.goal.textContent = state.goal || "No goal has been set yet.";
+    els.panel.classList.remove("idle","busy","ok","warn","err");
+    els.panel.classList.add(state.controlled ? "warn" : state.status || "idle");
+    els.panel.classList.toggle("controlled", state.controlled); els.panel.classList.toggle("hidden", !state.visible);
+    els.control.textContent = state.controlled ? "Give control back" : "Take control";
+    els.controlCopy.textContent = state.controlled ? "Resume only when you are ready." : "The agent pauses before its next step.";
+    els.attention.classList.toggle("on", !!state.attention); els.attentionHead.textContent = state.attention?.head || ""; els.attentionSub.textContent = state.attention?.sub || "";
+    renderHistory();
+  }
+  function paintCursor() { if (cursor) cursor.style.transform = `translate(${state.x-2}px, ${state.y-2}px)`; }
 
   const api = {
-    /** Glide the dot to (x, y), easing like a hand would. */
-    moveTo(x, y, ms = 340) {
-      mount();
-      if (state.anim) cancelAnimationFrame(state.anim);
-      const x0 = state.x, y0 = state.y;
-      const dx = x - x0, dy = y - y0;
-      const dist = Math.hypot(dx, dy);
-      if (dist < 2 || ms <= 0) { state.x = x; state.y = y; paintCursor(); return; }
-      // Long hops should not take proportionally long; a human flicks.
-      const dur = Math.min(ms, 180 + dist * 0.42);
-      const t0 = performance.now();
-      const ease = (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
-      const tick = (now) => {
-        const p = Math.min((now - t0) / dur, 1);
-        const e = ease(p);
-        state.x = x0 + dx * e;
-        state.y = y0 + dy * e;
-        paintCursor();
-        state.anim = p < 1 ? requestAnimationFrame(tick) : null;
-      };
-      state.anim = requestAnimationFrame(tick);
+    moveTo(x,y,ms=340) {
+      mount(); if (state.anim) cancelAnimationFrame(state.anim);
+      const x0=state.x,y0=state.y,dx=x-x0,dy=y-y0,dist=Math.hypot(dx,dy);
+      if (dist<2 || ms<=0) { state.x=x; state.y=y; paintCursor(); return; }
+      const dur=Math.min(ms,180+dist*.42),t0=performance.now();
+      const ease=(t)=>t<.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2;
+      const tick=(now)=>{ const p=Math.min((now-t0)/dur,1),e=ease(p); state.x=x0+dx*e; state.y=y0+dy*e; paintCursor(); state.anim=p<1?requestAnimationFrame(tick):null; };
+      state.anim=requestAnimationFrame(tick);
     },
-
-    click(x, y) {
-      mount();
-      if (x != null) { state.x = x; state.y = y; paintCursor(); }
-      if (!ripple) return;
-      ripple.style.left = state.x + "px";
-      ripple.style.top = state.y + "px";
-      ripple.classList.remove("go");
-      void ripple.offsetWidth; // restart the animation
-      ripple.classList.add("go");
-    },
-
-    highlight(box, label) {
-      mount();
-      if (!halo) return;
-      if (!box) { halo.classList.remove("on"); return; }
-      const [x, y, w, h] = box;
-      Object.assign(halo.style, {
-        transform: `translate(${x - 3}px, ${y - 3}px)`,
-        width: w + 6 + "px",
-        height: h + 6 + "px",
-      });
-      els.haloTag.textContent = label || "";
-      els.haloTag.style.display = label ? "block" : "none";
-      halo.classList.add("on");
-    },
-
+    click(x,y) { mount(); if (x!=null) { state.x=x; state.y=y; paintCursor(); } ripple.style.left=state.x+"px"; ripple.style.top=state.y+"px"; ripple.classList.remove("go"); void ripple.offsetWidth; ripple.classList.add("go"); },
+    highlight(box,label) { mount(); if (!box) { halo.classList.remove("on"); return; } const [x,y,w,h]=box; Object.assign(halo.style,{transform:`translate(${x-3}px, ${y-3}px)`,width:w+6+"px",height:h+6+"px"}); els.haloTag.textContent=label||""; els.haloTag.style.display=label?"block":"none"; halo.classList.add("on"); },
     clearHighlight() { if (halo) halo.classList.remove("on"); },
-
-    /** Append a line to the bar's rolling feed. */
-    say(tag, text, kind) {
-      mount();
-      if (!text) return;
-      const last = state.feed[state.feed.length - 1];
-      if (last && last.text === text && last.tag === tag) return;
-      state.feed.push({ tag, text, kind });
-      if (state.feed.length > 40) state.feed.shift();
-      renderFeed();
-    },
-
-    /** Status dot, step counter and goal. Every field optional. */
-    think(patch) {
-      mount();
-      if (!els) return;
-      if (patch.goal !== undefined) els.goal.textContent = patch.goal || "";
-      if (patch.step !== undefined) els.step.textContent = patch.step || "";
-      if (patch.thought) api.say("thinking", patch.thought, "think");
-      if (patch.action) api.say("action", patch.action, "act");
-      if (patch.status !== undefined) {
-        els.dot.className = "dot";
-        if (patch.status === "busy") els.dot.classList.add("busy");
-        else if (patch.status && patch.status !== "idle") els.dot.classList.add(patch.status);
-      }
-    },
-
-    /**
-     * Hand the browser to the person, or take it back.
-     *
-     * The agent is not merely paused visually — `controlled` is read by the Python
-     * side before every step, so nothing moves until this is switched back. That
-     * is the difference between a pause button and a real handover.
-     */
-    toggleControl(force) {
-      mount();
-      const next = force === undefined ? !state.controlled : !!force;
-      if (next === state.controlled) return state.controlled;
-      state.controlled = next;
-
-      els.bar.classList.toggle("controlled", next);
-      els.btnLabel.textContent = next ? "Give control back" : "Take control";
-      els.btnIcon.innerHTML = next ? "&#9654;" : "&#9995;";
-      els.cursor.classList.toggle("hidden", next);
-      if (next) {
-        api.clearHighlight();
-        api.say("you", "You have control. The agent is stopped.", "plan");
-        els.dot.className = "dot warn";
-      } else {
-        api.say("agent", "Control handed back. Resuming.", "act");
-        els.dot.className = "dot busy";
-      }
-
-      // Tell Python, if the binding is installed. Absent in a bare page.
-      try {
-        if (window.__chamberOnControl) window.__chamberOnControl(next);
-      } catch {}
-      return state.controlled;
-    },
-
-    /** Read by the loop before every step. */
+    say(tag,text,kind) { mount(); if (!text) return; const next={tag:tag||"activity",text,kind:kind||""}; const last=state.feed[state.feed.length-1]; if (last&&last.text===next.text&&last.tag===next.tag) return; state.current=next; state.feed.push(next); if (state.feed.length>100) state.feed.shift(); render(); },
+    think(patch) { mount(); if (patch.goal!==undefined) state.goal=patch.goal||""; if (patch.step!==undefined) state.step=patch.step||""; if (patch.status!==undefined) state.status=patch.status||"idle"; if (patch.thought) api.say("thinking",patch.thought,"think"); if (patch.action) api.say("action",patch.action,"act"); render(); },
+    toggleControl(force) { mount(); const next=force===undefined?!state.controlled:!!force; if (next===state.controlled) return state.controlled; state.controlled=next; if (next) { api.clearHighlight(); setExpanded(true); setView("activity"); } state.status=next?"warn":"busy"; state.current=next?{tag:"your control",text:"Agent paused. Use the browser normally.",kind:"plan"}:{tag:"resuming",text:"Control returned. Looking at the page again.",kind:"act"}; state.feed.push(state.current); render(); try { if (window.__chamberOnControl) window.__chamberOnControl(next); } catch {} return state.controlled; },
     isControlled() { return state.controlled; },
-
-    /** Full-width takeover banner. `head=null` clears it. */
-    banner(head, sub) {
-      mount();
-      if (!els) return;
-      if (!head) {
-        els.banner.classList.remove("on");
-        els.edge.classList.remove("on");
-        return;
-      }
-      els.bannerHead.textContent = head;
-      els.bannerSub.textContent = sub || "";
-      els.banner.classList.add("on");
-      els.edge.classList.add("on");
-    },
-
-    state() {
-      return {
-        x: Math.round(state.x),
-        y: Math.round(state.y),
-        mounted: state.mounted,
-        controlled: state.controlled,
-      };
-    },
+    banner(head,sub) { mount(); state.attention=head?{head,sub:sub||""}:null; if (head) { state.status="warn"; state.current={tag:"needs you",text:head,kind:"plan"}; state.feed.push(state.current); setExpanded(true); setView("activity"); } render(); },
+    hud(visible) { mount(); state.visible=!!visible; render(); savePrefs(); return state.visible; },
+    configure(patch={}) { mount(); if (patch.corner) setCorner(patch.corner); if (patch.view) setView(patch.view); if (patch.expanded!==undefined) setExpanded(patch.expanded); if (Number.isFinite(patch.width)) { state.width=Math.max(MIN_W,Math.min(window.innerWidth-24,patch.width)); els.panel.style.width=state.width+"px"; } if (Number.isFinite(patch.height)) { state.height=Math.max(MIN_H,Math.min(window.innerHeight-24,patch.height)); els.details.style.height=Math.max(state.height-68,120)+"px"; } if (patch.visible!==undefined) state.visible=!!patch.visible; render(); },
+    state() { return {x:Math.round(state.x),y:Math.round(state.y),mounted:state.mounted,controlled:state.controlled,visible:state.visible,expanded:state.expanded,corner:state.corner,view:state.view,width:Math.round(state.width),height:Math.round(state.height)}; },
   };
-
-  window.__chamberOverlay = api;
-
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", mount, { once: true });
-  } else {
-    mount();
-  }
+  window.__chamberOverlay=api;
+  if (document.readyState==="loading") document.addEventListener("DOMContentLoaded",mount,{once:true}); else mount();
 })();

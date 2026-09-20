@@ -63,6 +63,14 @@ class TestImagesOnTheWire:
         parts = Message("user", "compare", images=["QQ==", "Qg=="]).to_openai()["content"]
         assert sum(1 for p in parts if p["type"] == "image_url") == 2
 
+    def test_responses_shape(self):
+        payload = Message("user", "what is this?", images=["QUJD"]).to_responses()
+        assert payload["content"][0] == {"type": "input_text", "text": "what is this?"}
+        assert payload["content"][1] == {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,QUJD",
+        }
+
 
 class TestRequestBuilding:
     def test_keep_alive_is_sent_when_configured(self):
@@ -84,6 +92,45 @@ class TestRequestBuilding:
             "sys", [Message("user", "look", images=["QUJD"])], None
         )
         assert payload["messages"][1]["content"][1]["type"] == "image_url"
+
+    def test_official_responses_payload_has_reasoning_and_flat_tools(self):
+        llm = LLM(
+            ModelConfig(
+                provider="openai",
+                model="gpt-5.6-luna",
+                base_url="https://api.openai.com/v1",
+                api_key="sk-test",
+                api_style="responses",
+                reasoning_effort="medium",
+            )
+        )
+        payload, url, _ = llm._responses_request(
+            "sys",
+            [Message("user", "hi")],
+            [{"name": "click", "description": "d", "input_schema": {"type": "object"}}],
+        )
+        assert url.endswith("/responses")
+        assert payload["instructions"] == "sys"
+        assert payload["reasoning"] == {"effort": "medium", "summary": "auto"}
+        assert payload["tools"][0]["name"] == "click"
+        assert "function" not in payload["tools"][0]
+
+    def test_parses_responses_output_and_summary(self):
+        response = LLM._parse_responses(
+            {
+                "status": "completed",
+                "output": [
+                    {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Checked the page."}]},
+                    {"type": "message", "content": [{"type": "output_text", "text": "Ready"}]},
+                    {"type": "function_call", "name": "click", "arguments": '{"ref":"e1"}', "call_id": "c1"},
+                ],
+                "usage": {"input_tokens": 12, "output_tokens": 4},
+            }
+        )
+        assert response.text == "Ready"
+        assert response.reasoning_summary == "Checked the page."
+        assert response.tool_calls[0].arguments == {"ref": "e1"}
+        assert response.input_tokens == 12
 
 
 class TestToolCallingFallback:

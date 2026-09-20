@@ -89,10 +89,27 @@ CREATE TABLE IF NOT EXISTS visit (
     at        REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS model_exchange (
+    id          TEXT PRIMARY KEY,
+    run_id      TEXT NOT NULL REFERENCES run(id),
+    role        TEXT NOT NULL,
+    model       TEXT NOT NULL,
+    api_style   TEXT,
+    reasoning_effort TEXT,
+    request_json TEXT,
+    response_json TEXT,
+    started_at  REAL NOT NULL,
+    ended_at    REAL,
+    ms          INTEGER,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_step_run   ON step(run_id, n);
 CREATE INDEX IF NOT EXISTS idx_action_run ON action(run_id, step_n, seq);
 CREATE INDEX IF NOT EXISTS idx_visit_run  ON visit(run_id);
 CREATE INDEX IF NOT EXISTS idx_visit_canon ON visit(canonical);
+CREATE INDEX IF NOT EXISTS idx_model_run ON model_exchange(run_id, started_at);
 """
 
 
@@ -230,6 +247,79 @@ class TraceStore:
                 [(self.run_id, c) for c in canon],
             )
 
+    def record_model_event(self, event: str, payload: dict[str, Any]) -> None:
+        """Keep the exact inspectable model boundary for a run.
+
+        Images are represented by counts in the request payload rather than copied
+        into SQLite as base64. Prompt text, tool schemas, returned text, tool calls,
+        API reasoning summaries and usage are retained in full.
+        """
+        if not self.run_id or event not in ("llm_request", "llm_response"):
+            return
+        exchange_id = str(payload.get("exchange_id") or "")
+        if not exchange_id:
+            return
+        now = time.time()
+        if event == "llm_request":
+            request = payload.get("request") or {}
+            with self.conn:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO model_exchange "
+                    "(id, run_id, role, model, api_style, reasoning_effort, request_json, started_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        exchange_id,
+                        self.run_id,
+                        str(payload.get("role", "model")),
+                        str(payload.get("model", "")),
+                        str(payload.get("api_style", "")),
+                        str(payload.get("reasoning_effort") or ""),
+                        json.dumps(request, ensure_ascii=False, default=str),
+                        now,
+                    ),
+                )
+            return
+
+        response = {
+            "text": payload.get("text", ""),
+            "reasoning_summary": payload.get("reasoning_summary", ""),
+            "tool_calls": payload.get("tool_calls") or [],
+            "stop_reason": payload.get("stop_reason", ""),
+        }
+        seconds = float(payload.get("seconds", 0) or 0)
+        with self.conn:
+            updated = self.conn.execute(
+                "UPDATE model_exchange SET response_json=?, ended_at=?, ms=?, "
+                "input_tokens=?, output_tokens=? WHERE id=? AND run_id=?",
+                (
+                    json.dumps(response, ensure_ascii=False, default=str),
+                    now,
+                    int(seconds * 1000),
+                    int(payload.get("input_tokens", 0) or 0),
+                    int(payload.get("output_tokens", 0) or 0),
+                    exchange_id,
+                    self.run_id,
+                ),
+            )
+            if not updated.rowcount:
+                self.conn.execute(
+                    "INSERT INTO model_exchange "
+                    "(id, run_id, role, model, response_json, started_at, ended_at, ms, input_tokens, output_tokens) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        exchange_id,
+                        self.run_id,
+                        str(payload.get("role", "model")),
+                        str(payload.get("model", "")),
+                        json.dumps(response, ensure_ascii=False, default=str),
+                        now - seconds,
+                        now,
+                        int(seconds * 1000),
+                        int(payload.get("input_tokens", 0) or 0),
+                        int(payload.get("output_tokens", 0) or 0),
+                    ),
+                )
+
     # ------------------------------------------------------------------- reads
 
     def runs(self, limit: int = 20) -> list[dict[str, Any]]:
@@ -276,6 +366,55 @@ class TraceStore:
             (run_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def model_exchanges(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM model_exchange WHERE run_id=? ORDER BY started_at, rowid",
+            (run_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def model_transcript(self, run_id: str) -> str:
+        """Full prompts and outputs at the model boundary.
+
+        Reasoning summaries are included only when the provider returned one. They
+        are summaries exposed by the API, not private chain-of-thought.
+        """
+        run = self.run(run_id)
+        if run is None:
+            return f"no such run: {run_id}"
+        exchanges = self.model_exchanges(run_id)
+        if not exchanges:
+            return f"run {run_id}\n  no model exchanges were recorded"
+        lines = [f"run {run_id} — model transcript", f"task: {run['task']}"]
+        for index, row in enumerate(exchanges, 1):
+            lines.extend(
+                [
+                    "",
+                    f"=== {index}. {row['role']} · {row['model']} · {row['ms'] or 0}ms ===",
+                    f"transport: {row['api_style'] or 'unknown'} · reasoning: {row['reasoning_effort'] or 'unspecified'}",
+                    f"tokens: {row['input_tokens'] or 0} in / {row['output_tokens'] or 0} out",
+                ]
+            )
+            request = json.loads(row["request_json"] or "{}")
+            if request.get("system"):
+                lines.extend(["", "[system]", request["system"]])
+            for message in request.get("messages") or []:
+                suffix = f" · {message.get('images')} image(s)" if message.get("images") else ""
+                lines.extend(["", f"[{message.get('role', 'message')}{suffix}]", message.get("content", "")])
+            tools = request.get("tools") or []
+            if tools:
+                lines.extend(["", "[available tools]", json.dumps(tools, ensure_ascii=False, indent=2)])
+            response = json.loads(row["response_json"] or "{}")
+            if response.get("reasoning_summary"):
+                lines.extend(["", "[provider reasoning summary]", response["reasoning_summary"]])
+            if response.get("text"):
+                lines.extend(["", "[model output]", response["text"]])
+            if response.get("tool_calls"):
+                lines.extend(["", "[tool calls]", json.dumps(response["tool_calls"], ensure_ascii=False, indent=2)])
+            if not response:
+                lines.extend(["", "[response missing — the request did not finish]"])
+        return "\n".join(lines)
 
     def timeline(self, run_id: str) -> str:
         """The run as an indented tree — steps, their actions, and the pages seen."""
@@ -328,6 +467,11 @@ class TraceStore:
         if run["summary"]:
             lines.append("")
             lines.append(f"  result: {'✓' if run['success'] else '✗'} {run['summary'][:400]}")
+        exchanges = self.model_exchanges(run_id)
+        if exchanges:
+            lines.append(
+                f"  model exchanges: {len(exchanges)} (use chamber trace {run_id} --llm for full prompts and outputs)"
+            )
         return "\n".join(lines)
 
 

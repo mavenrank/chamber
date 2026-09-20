@@ -16,9 +16,9 @@
 
 ---
 
-One real browser window, on your screen, with a cursor you can watch and a bar
-across the top saying what it is doing and why. Nothing happens off-screen. When it
-hits a captcha it asks you. When you press **Take control**, it stops.
+One real browser window, on your screen, with a cursor you can watch and a separate
+Chamber Desk window saying what it is doing and why. Nothing happens off-screen.
+When it hits a captcha it asks you. When you press **Take control**, it stops.
 
 ```bash
 uv sync --extra mcp
@@ -67,6 +67,17 @@ genuinely cannot reach.
 The second difference is that it is **watchable**. An agent that works invisibly is
 one you cannot supervise, cannot debug, and cannot trust with anything that matters.
 
+The live read-out is a small React/Vite app hosted in a separate Chromium app
+window. It has a continuously shimmering current state, a scrollable activity chain,
+model-visible response summaries, tool calls, and inline screenshots used by vision.
+The older page overlay is still installed for its cursor, highlights, and control API;
+set `CHAMBER_DISPLAY=page` to bring its panel back while the new display is being
+validated, or `CHAMBER_DISPLAY=off` to hide both read-outs.
+
+Display status is also an extension point. A workflow can add an
+`EventStatusGetter`, a parser returning `StatusUpdate`, and register the pair with
+`ch.register_display_status_adapter(...)`; the loop and React app stay unchanged.
+
 ---
 
 ## What it does
@@ -87,10 +98,10 @@ was specified is a formatting slip, not a wrong decision — so it is repaired, 
 the repair is reported so the model converges. Ambiguity is still rejected: the rule
 is repair syntax, never guess intent.
 
-**Shows its work.** A bar across the top of every page with the goal, the current
-step, and an auto-scrolling feed of what each model said. A synthetic cursor glides
-to what it is about to click. Your real mouse is never touched — input is
-synthesized inside the browser, so the machine stays yours.
+**Shows its work.** Chamber Desk presents the goal, current state, and an
+auto-scrolling feed of what each model said. A synthetic cursor still glides to
+what it is about to click inside the browser. Your real mouse is never touched —
+input is synthesized inside the browser, so the machine stays yours.
 
 **Hands over on demand.** The **Take control** button stops the agent dead, checked
 before every step and enforced again in the executor. Press it again to resume.
@@ -105,6 +116,8 @@ tokens and needs no vision of its own. Fires automatically when the loop is stuc
 
 **Keeps a trail.** Every run records its steps, actions, repairs and the pages it
 opened — with those the answer cited marked apart from those merely looked at.
+`chamber trace <run-id> --llm` adds the exact prompts, model outputs, tool calls,
+usage and provider-supplied reasoning summaries (never private chain-of-thought).
 
 **Blocks ads for real.** Genuine uBlock Origin, Manifest V2, blocking `webRequest`.
 
@@ -124,10 +137,10 @@ All three are optional and independently configurable. Drop the planner and the 
 model plans for itself; drop vision and screenshots just save to disk.
 
 ```ini
-CHAMBER_ORCHESTRATOR_MODEL=gpt-5.6-luna
-CHAMBER_MODEL=mimo-v2.5
+CHAMBER_ORCHESTRATOR_MODEL=mimo-v2.5-free
+CHAMBER_MODEL=mimo-v2.5-free
 CHAMBER_VISION_MODEL=qwen2.5vl:3b
-CHAMBER_VISION_FALLBACK_MODEL=gpt-5.6-luna
+CHAMBER_VISION_FALLBACK_MODEL=mimo-v2.5-free
 ```
 
 ---

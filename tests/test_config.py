@@ -12,7 +12,7 @@ import json
 import pytest
 
 from chamber.browser import profile as profile_mod
-from chamber.config import BrowserConfig, ChamberConfig, ModelConfig
+from chamber.config import BrowserConfig, ChamberConfig, DisplayConfig, ModelConfig
 
 
 class TestConfig:
@@ -34,8 +34,44 @@ class TestConfig:
     def test_autodetects_openai_when_only_that_key_is_set(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv("CHAMBER_PROVIDER", raising=False)
         monkeypatch.delenv("CHAMBER_ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CHAMBER_MODEL", raising=False)
+        monkeypatch.delenv("CHAMBER_OPENAI_BASE_URL", raising=False)
+        monkeypatch.delenv("CHAMBER_OPENAI_API_STYLE", raising=False)
+        monkeypatch.delenv("CHAMBER_REASONING_EFFORT", raising=False)
         monkeypatch.setenv("CHAMBER_OPENAI_API_KEY", "sk-test")
-        assert ChamberConfig.from_env().model.provider == "openai"
+        model = ChamberConfig.from_env().model
+        assert model.provider == "openai"
+        assert model.model == "gpt-5.6-luna"
+        assert model.api_style == "responses"
+        assert model.reasoning_effort == "medium"
+        assert model.base_url == "https://api.openai.com/v1"
+
+    def test_opencode_key_keeps_the_compatible_provider_path(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("CHAMBER_PROVIDER", raising=False)
+        monkeypatch.delenv("CHAMBER_OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("CHAMBER_MODEL", raising=False)
+        monkeypatch.delenv("CHAMBER_OPENAI_BASE_URL", raising=False)
+        monkeypatch.delenv("CHAMBER_OPENAI_API_STYLE", raising=False)
+        monkeypatch.delenv("CHAMBER_REASONING_EFFORT", raising=False)
+        monkeypatch.setenv("OPENCODE_API_KEY", "sk-opencode")
+        model = ChamberConfig.from_env().model
+        assert model.model == "mimo-v2.5"
+        assert model.api_style == "chat_completions"
+        assert model.base_url == "https://opencode.ai/zen/go/v1"
+
+    def test_official_and_opencode_credentials_can_live_side_by_side(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("CHAMBER_BACKEND", "openai")
+        monkeypatch.setenv("CHAMBER_OPENAI_BASE_URL", "https://opencode.ai/zen/go/v1")
+        monkeypatch.setenv("CHAMBER_OPENAI_API_KEY", "legacy-opencode")
+        monkeypatch.setenv("CHAMBER_OFFICIAL_OPENAI_API_KEY", "official-openai")
+        monkeypatch.delenv("CHAMBER_MODEL", raising=False)
+        model = ChamberConfig.from_env().model
+        assert model.base_url == "https://api.openai.com/v1"
+        assert model.api_key == "official-openai"
+        assert model.model == "gpt-5.6-luna"
+        assert model.reasoning_effort == "medium"
 
     def test_nested_overrides(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("CHAMBER_OPENAI_API_KEY", "sk-test")
@@ -58,6 +94,18 @@ class TestConfig:
         # frozen dataclasses raise FrozenInstanceError, a subclass of AttributeError.
         with pytest.raises(AttributeError):
             ChamberConfig().browser.profile = "other"  # type: ignore[misc]
+
+    def test_chamber_desk_is_the_default_display(self):
+        assert ChamberConfig().display == DisplayConfig(mode="window")
+
+    def test_display_mode_can_restore_the_old_page_panel(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("CHAMBER_DISPLAY", "page")
+        assert ChamberConfig.from_env().display.mode == "page"
+
+    def test_display_mode_can_be_overridden_in_code(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("CHAMBER_DISPLAY", raising=False)
+        cfg = ChamberConfig.from_env(display__mode="off")
+        assert cfg.display.mode == "off"
 
 
 class TestProfileSeeding:

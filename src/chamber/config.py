@@ -17,6 +17,9 @@ from dotenv import load_dotenv
 from chamber.overlay import DEFAULT_SKIP_HOSTS
 
 Provider = Literal["openai", "anthropic"]
+APIStyle = Literal["chat_completions", "responses"]
+ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh", "max"]
+DisplayMode = Literal["window", "page", "off"]
 
 load_dotenv(override=False)
 
@@ -57,6 +60,10 @@ class ModelConfig:
     # gaps between vision calls routinely exceed 5 minutes, so without this every
     # look pays the reload. Ignored by providers that do not understand it.
     keep_alive: str | None = None
+    # Official OpenAI models use the Responses API. OpenAI-compatible services
+    # such as OpenCode keep the Chat Completions wire format beside it.
+    api_style: APIStyle = "chat_completions"
+    reasoning_effort: ReasoningEffort | None = None
 
     def redacted(self) -> dict[str, object]:
         return {
@@ -65,6 +72,8 @@ class ModelConfig:
             "base_url": self.base_url,
             "api_key": f"...{self.api_key[-4:]}" if self.api_key else None,
             "tool_calling": self.tool_calling,
+            "api_style": self.api_style,
+            "reasoning_effort": self.reasoning_effort,
         }
 
 
@@ -131,6 +140,19 @@ class LoopConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DisplayConfig:
+    """Where the live loop read-out appears.
+
+    ``window`` is the new React/Vite Chamber Desk companion. ``page`` keeps the
+    existing in-page panel visible for compatibility, and ``off`` leaves the
+    browser-control tether available without either read-out. The old overlay is
+    deliberately retained; this switch only changes whether its panel is shown.
+    """
+
+    mode: DisplayMode = "window"
+
+
+@dataclass(frozen=True, slots=True)
 class ChamberConfig:
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     # The step model: sees the page, emits the next action. Called every step, so
@@ -153,6 +175,7 @@ class ChamberConfig:
     # screen"); a hosted one is the backstop for the cases that matter.
     vision_fallbacks: tuple[ModelConfig, ...] = ()
     trace: bool = True
+    display: DisplayConfig = field(default_factory=DisplayConfig)
 
     # --- convenience ------------------------------------------------------
     @property
@@ -173,9 +196,12 @@ class ChamberConfig:
         """
         provider = os.environ.get("CHAMBER_PROVIDER", "").strip().lower()
         anthropic_key = os.environ.get("CHAMBER_ANTHROPIC_API_KEY")
-        openai_key = os.environ.get("CHAMBER_OPENAI_API_KEY") or os.environ.get(
-            "OPENCODE_API_KEY"
-        )
+        generic_openai_key = os.environ.get("CHAMBER_OPENAI_API_KEY")
+        official_openai_key = os.environ.get(
+            "CHAMBER_OFFICIAL_OPENAI_API_KEY"
+        ) or os.environ.get("OPENAI_API_KEY")
+        opencode_key = os.environ.get("OPENCODE_API_KEY")
+        openai_key = official_openai_key or generic_openai_key or opencode_key
         if provider not in ("openai", "anthropic"):
             provider = "anthropic" if (anthropic_key and not openai_key) else "openai"
 
@@ -188,14 +214,53 @@ class ChamberConfig:
                 tool_calling=_env_bool("CHAMBER_TOOL_CALLING", True),
             )
         else:
+            configured_base = os.environ.get("CHAMBER_OPENAI_BASE_URL")
+            backend = os.environ.get("CHAMBER_BACKEND", "").strip().lower()
+            # Keep the existing OpenCode path intact. A real OpenAI key selects
+            # the official endpoint unless a compatible endpoint was explicitly
+            # provided; OPENCODE_API_KEY continues to select OpenCode Go.
+            direct_openai_key = official_openai_key or (
+                generic_openai_key
+                if not configured_base or "api.openai.com" in configured_base
+                else None
+            )
+            direct_openai = backend == "openai" or (
+                backend != "opencode" and bool(direct_openai_key)
+            )
+            base_url = (
+                (
+                    configured_base
+                    if configured_base and "api.openai.com" in configured_base
+                    else "https://api.openai.com/v1"
+                )
+                if direct_openai
+                else configured_base or "https://opencode.ai/zen/go/v1"
+            )
+            api_style = os.environ.get(
+                "CHAMBER_OPENAI_API_STYLE",
+                "responses" if direct_openai else "chat_completions",
+            )
+            if api_style not in ("chat_completions", "responses"):
+                api_style = "responses" if direct_openai else "chat_completions"
+            effort = os.environ.get(
+                "CHAMBER_REASONING_EFFORT", "medium" if direct_openai else ""
+            ).lower()
+            if effort not in ("none", "low", "medium", "high", "xhigh", "max"):
+                effort = ""
             model = ModelConfig(
                 provider="openai",
-                model=os.environ.get("CHAMBER_MODEL", "mimo-v2.5"),
-                base_url=os.environ.get(
-                    "CHAMBER_OPENAI_BASE_URL", "https://opencode.ai/zen/go/v1"
+                model=os.environ.get(
+                    "CHAMBER_MODEL", "gpt-5.6-luna" if direct_openai else "mimo-v2.5"
                 ),
-                api_key=openai_key,
+                base_url=base_url,
+                api_key=(
+                    (official_openai_key or generic_openai_key)
+                    if direct_openai
+                    else (opencode_key or generic_openai_key)
+                ),
                 tool_calling=_env_bool("CHAMBER_TOOL_CALLING", True),
+                api_style=api_style,  # type: ignore[arg-type]
+                reasoning_effort=effort or None,  # type: ignore[arg-type]
             )
 
         # Vision is opt-in by naming a model. Ollama's OpenAI-compatible endpoint is
@@ -273,12 +338,16 @@ class ChamberConfig:
                 else tuple(h.strip().lower() for h in raw_skip.split(",") if h.strip())
             ),
         )
+        display_mode = os.environ.get("CHAMBER_DISPLAY", "window").strip().lower()
+        if display_mode not in ("window", "page", "off"):
+            display_mode = "window"
         cfg = cls(
             browser=browser,
             model=model,
             orchestrator=orchestrator,
             vision=vision,
             vision_fallbacks=(fallback,) if fallback else (),
+            display=DisplayConfig(mode=display_mode),  # type: ignore[arg-type]
         )
         return _apply_overrides(cfg, overrides)
 
@@ -286,7 +355,12 @@ class ChamberConfig:
 def _apply_overrides(cfg: ChamberConfig, overrides: dict[str, object]) -> ChamberConfig:
     """Apply dotted or nested overrides: `profile="x"`, `browser__headless=True`."""
     top: dict[str, object] = {}
-    nested: dict[str, dict[str, object]] = {"browser": {}, "model": {}, "loop": {}}
+    nested: dict[str, dict[str, object]] = {
+        "browser": {},
+        "model": {},
+        "loop": {},
+        "display": {},
+    }
     for key, value in overrides.items():
         if value is None:
             continue
@@ -297,7 +371,7 @@ def _apply_overrides(cfg: ChamberConfig, overrides: dict[str, object]) -> Chambe
             nested[section][attr] = value
         elif key == "profile":
             nested["browser"]["profile"] = value
-        elif key in ("browser", "model", "loop", "vision", "trace"):
+        elif key in ("browser", "model", "loop", "vision", "trace", "display"):
             top[key] = value
         else:
             raise ValueError(f"unknown config key {key!r}")
@@ -308,6 +382,8 @@ def _apply_overrides(cfg: ChamberConfig, overrides: dict[str, object]) -> Chambe
         top.setdefault("model", replace(cfg.model, **nested["model"]))
     if nested["loop"]:
         top.setdefault("loop", replace(cfg.loop, **nested["loop"]))
+    if nested["display"]:
+        top.setdefault("display", replace(cfg.display, **nested["display"]))
     return replace(cfg, **top) if top else cfg
 
 

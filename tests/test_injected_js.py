@@ -19,7 +19,14 @@ from pathlib import Path
 import pytest
 
 JS_DIR = Path(__file__).resolve().parent.parent / "src" / "chamber"
-JS_FILES = sorted(JS_DIR.rglob("*.js"))
+# The React display has its own generated Vite bundle and local npm dependencies.
+# They are application assets, not injected Chamber scripts; walking them here
+# would make this test lint React/Vite's third-party source as if it were ours.
+JS_FILES = sorted(
+    path
+    for path in JS_DIR.rglob("*.js")
+    if "node_modules" not in path.parts and "dist" not in path.parts
+)
 
 
 def test_there_are_injected_scripts_to_check():

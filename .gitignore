@@ -1,8 +1,11 @@
 # Python
 __pycache__/
 *.py[oc]
+node_modules/
 build/
 dist/
+!src/chamber/display/dist/
+!src/chamber/display/dist/*
 wheels/
 *.egg-info/
 .pytest_cache/

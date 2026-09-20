@@ -7,7 +7,7 @@ than crash — so failures here are logged at debug level and swallowed.
 
 The one thing this does *not* do is move the operating system's mouse pointer.
 Playwright's mouse and CDP's Input domain synthesize events inside the browser; the
-user's actual cursor stays where they left it. The dot is a read-out, not a driver.
+user's actual cursor stays where they left it. The visible pointer is a read-out.
 """
 
 from __future__ import annotations
@@ -65,8 +65,10 @@ def _skips(url: str, hosts: tuple[str, ...]) -> bool:
 async def install(
     context: BrowserContext,
     on_control: Callable[[bool], None] | None = None,
+    on_prefs: Callable[[dict[str, object] | None], dict[str, object]] | None = None,
     *,
     skip_hosts: tuple[str, ...] = DEFAULT_SKIP_HOSTS,
+    show_panel: bool = True,
 ) -> None:
     """Arrange for the overlay to exist on every page, including after navigation.
 
@@ -90,9 +92,28 @@ async def install(
         with contextlib.suppress(PWError):  # already bound on a reused context
             await context.expose_binding("__chamberOnControl", _binding)
 
-    # The skip list is handed to the script rather than compiled into it, so the
-    # same source works for a caller that wants the overlay everywhere.
-    preamble = f"window.__chamberSkipHosts = {json.dumps(list(skip_hosts))};"
+    if on_prefs is not None:
+
+        def _prefs_binding(
+            _source: object, patch: dict[str, object] | None = None
+        ) -> dict[str, object]:
+            try:
+                return on_prefs(patch if isinstance(patch, dict) else None)
+            except Exception:
+                log.debug("overlay preferences callback raised", exc_info=True)
+                return {}
+
+        with contextlib.suppress(PWError):
+            await context.expose_binding("__chamberOverlayPrefs", _prefs_binding)
+
+    # The skip list and panel visibility are handed to the script rather than
+    # compiled into it. The old overlay remains fully installed in window mode so
+    # its cursor, highlights, and control API keep working; only its panel is
+    # hidden while Chamber Desk is the read-out.
+    preamble = (
+        f"window.__chamberSkipHosts = {json.dumps(list(skip_hosts))};"
+        f" window.__chamberOverlayPanel = {json.dumps(show_panel)};"
+    )
     await context.add_init_script(f"{preamble}\n{source()}")
 
 
@@ -209,7 +230,7 @@ class Overlay:
     # --- handing control back ----------------------------------------------
 
     async def banner(self, head: str | None, sub: str = "") -> None:
-        """Full-width takeover banner. `head=None` clears it."""
+        """Show an attention block inside the corner panel; `head=None` clears it."""
         await self._call(
             "([h, s]) => window.__chamberOverlay?.banner(h, s)", [head, sub]
         )
@@ -221,7 +242,7 @@ class Overlay:
     # --- handing the browser over -------------------------------------------
 
     async def say(self, tag: str, text: str, kind: str = "") -> None:
-        """Append a line to the bar's rolling feed."""
+        """Replace the live line and retain the previous item in panel history."""
         await self._call(
             "([t, x, k]) => window.__chamberOverlay?.say(t, x, k)", [tag, text, kind]
         )

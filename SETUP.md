@@ -13,6 +13,17 @@ uv run chamber doctor
 check that matters — "I passed `--load-extension`" and "the extension is running"
 are different claims.
 
+The default run display is Chamber Desk, a bundled React/Vite window. Its source is
+under `src/chamber/display/web`; the checked-in production bundle is loaded by the
+Python host, so normal users do not need Node after installation. During display
+development, rebuild it with:
+
+```bash
+cd src/chamber/display/web
+npm install
+npm run build
+```
+
 ---
 
 ## 1. Python
@@ -99,13 +110,37 @@ cp .env.example .env
 
 Chamber speaks two protocols and autodetects from whichever key is present.
 
-**OpenAI-compatible** — OpenCode Go, OpenRouter, Together, vLLM, LM Studio, Ollama:
+**Official OpenAI** — Responses API, GPT-5.6 Luna at medium reasoning:
 
 ```ini
-CHAMBER_OPENAI_BASE_URL=https://opencode.ai/zen/go/v1
-CHAMBER_OPENAI_API_KEY=sk-...
-CHAMBER_MODEL=mimo-v2.5
+CHAMBER_BACKEND=openai
+CHAMBER_OFFICIAL_OPENAI_API_KEY=sk-...
+CHAMBER_MODEL=gpt-5.6-luna
+CHAMBER_REASONING_EFFORT=medium
+CHAMBER_OPENAI_API_STYLE=responses
 ```
+
+`CHAMBER_OPENAI_API_KEY` is an API Platform credential. ChatGPT Plus includes
+access to OpenAI products such as Codex, but it is not a general API credential
+for a custom HTTP client and API usage is billed separately.
+
+**OpenCode Zen** — limited-time free MiMo option, plus OpenRouter, Together, vLLM,
+LM Studio, and Ollama:
+
+```ini
+CHAMBER_OPENAI_BASE_URL=https://opencode.ai/zen/v1
+OPENCODE_API_KEY=sk-...
+CHAMBER_MODEL=mimo-v2.5-free
+```
+
+OpenCode lists `mimo-v2.5-free` as free for a limited time; review its current
+privacy terms before sending sensitive data.
+
+The two paths are independent and both keys can remain in `.env`.
+`CHAMBER_BACKEND=openai` selects `CHAMBER_OFFICIAL_OPENAI_API_KEY`;
+`CHAMBER_BACKEND=opencode` selects `OPENCODE_API_KEY` (or the legacy
+`CHAMBER_OPENAI_API_KEY`). Set `CHAMBER_OPENAI_BASE_URL` for another compatible
+service.
 
 **Anthropic native:**
 

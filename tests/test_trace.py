@@ -71,6 +71,43 @@ class TestRecording:
         store.record_action(1, 0, name="click", args={}, why="", outcome="stale_ref", message="gone")
         assert any(a["outcome"] == "stale_ref" for a in store.actions("run-1"))
 
+    def test_model_boundary_is_recorded_in_full(self, store):
+        request = {
+            "exchange_id": "x1",
+            "role": "step",
+            "model": "gpt-5.6-luna",
+            "api_style": "responses",
+            "reasoning_effort": "medium",
+            "request": {
+                "system": "system rules",
+                "messages": [{"role": "user", "content": "entire prompt", "images": 0}],
+                "tools": [{"name": "click"}],
+            },
+        }
+        store.record_model_event("llm_request", request)
+        store.record_model_event(
+            "llm_response",
+            {
+                "exchange_id": "x1",
+                "role": "step",
+                "model": "gpt-5.6-luna",
+                "seconds": 1.25,
+                "text": "full answer",
+                "reasoning_summary": "considered the visible controls",
+                "tool_calls": [{"name": "click", "arguments": {"ref": "e1"}}],
+                "input_tokens": 20,
+                "output_tokens": 5,
+                "stop_reason": "completed",
+            },
+        )
+        rows = store.model_exchanges("run-1")
+        assert len(rows) == 1
+        transcript = store.model_transcript("run-1")
+        assert "system rules" in transcript
+        assert "entire prompt" in transcript
+        assert "full answer" in transcript
+        assert "provider reasoning summary" in transcript
+
 
 class TestSources:
     def test_groups_repeat_visits(self, store):

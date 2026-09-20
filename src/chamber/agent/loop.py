@@ -157,6 +157,14 @@ class Agent:
         await self.ch.overlay.think(goal=task, thought="Starting.", status="busy", step="0")
         self._emit("run_start", task=task)
 
+        if self.store:
+            self.store.start_run(
+                self.ch.run_id,
+                task,
+                profile=self.ch.config.profile,
+                model=f"{self.llm.config.provider}/{self.llm.config.model}",
+            )
+
         # Load the vision model now rather than mid-run. The first stuck moment is
         # the worst possible time to discover it needs 90 seconds to come off disk,
         # and `keep_alive` then holds it in VRAM for the rest of the run.
@@ -166,14 +174,6 @@ class Agent:
             if warmed is not None:
                 loaded, took = warmed
                 self._emit("vision_ready", loaded=loaded, seconds=took)
-
-        if self.store:
-            self.store.start_run(
-                self.ch.run_id,
-                task,
-                profile=self.ch.config.profile,
-                model=f"{self.llm.config.provider}/{self.llm.config.model}",
-            )
 
         if start_url:
             await self.ch.goto(start_url)
@@ -195,7 +195,7 @@ class Agent:
                 self.ch.last_snapshot = None
 
             # --- observe ---------------------------------------------------
-            snap = await self.ch.observe()
+            snap = await self.ch.observe(display_event=False)
             step.url = snap.url
             step.fingerprint = serialize.fingerprint(snap)
 
@@ -231,13 +231,28 @@ class Agent:
                     path = await self.ch.screenshot(
                         name=f"stuck-step{n}.png", scale=cfg.vision_scale
                     )
+                    vision_question = (
+                        f"Inspect the current screen for blockers while working on: {task}"
+                    )
+                    self._emit(
+                        "vision_request",
+                        step=n,
+                        screenshot=str(path),
+                        question=vision_question,
+                    )
                     # The one moment an image reliably beats the structure: after
                     # the model has had its chances with text and still cannot see
                     # what is in the way. Described in words, so the planner needs
                     # no vision of its own.
                     seen = await self.ch.vision.why_stuck(path, task)
                     note += f"\n\nI had a vision model look at the screen: {seen}"
-                    self._emit("vision", step=n, text=seen)
+                    self._emit(
+                        "vision",
+                        step=n,
+                        text=seen,
+                        screenshot=str(path),
+                        question=vision_question,
+                    )
 
                 feedback = f"{feedback}\n\n{note}" if feedback else note
                 self._emit("stuck", step=n, count=stuck_count, vision=use_vision)
@@ -353,7 +368,7 @@ class Agent:
                 step.actions.append(action.action)
                 if action.why:
                     await self.ch.overlay.think(thought=f"{parsed.thought} — {action.why}".strip(" —"))
-                result = await self.ch.act(action)
+                result = await self.ch.act(action, display_event=False)
                 results.append(result)
                 self._emit(
                     "action", step=n, name=action.action, ok=result.ok, detail=result.message
@@ -588,25 +603,39 @@ async def run_task(
     from chamber.trace.store import open_store
 
     cfg = chamber.config
+    await chamber.start_display()
     with contextlib.ExitStack() as stack:
         store = stack.enter_context(open_store()) if cfg.trace else None
+
+        def emit(event: str, payload: dict[str, Any]) -> None:
+            # One fan-out point keeps the window, terminal, MCP progress stream,
+            # and trace view on the same ordered event chain.
+            chamber._display_event(event, payload)
+            if on_event is not None:
+                on_event(event, payload)
+
+        def observe_model(event: str, payload: dict[str, Any]) -> None:
+            if store is not None:
+                store.record_model_event(event, payload)
+            emit(event, payload)
+
         async with AsyncExitStack() as aes:
             # Roles let a viewer tell the three models apart in one event stream.
             llm = await aes.enter_async_context(
-                LLM(cfg.model, observer=on_event, role="step")
+                LLM(cfg.model, observer=observe_model, role="step")
             )
             if chamber.vision is not None:
-                chamber.vision.attach_observer(on_event)
+                chamber.vision.attach_observer(observe_model)
             orchestrator = None
             if cfg.orchestrator is not None:
                 planner = await aes.enter_async_context(
-                    LLM(cfg.orchestrator, observer=on_event, role="planner")
+                    LLM(cfg.orchestrator, observer=observe_model, role="planner")
                 )
                 orchestrator = Orchestrator(planner)
             agent = Agent(
                 chamber,
                 llm,
-                on_event=on_event,
+                on_event=emit,
                 store=store,
                 orchestrator=orchestrator,
                 system_extra=system_extra,

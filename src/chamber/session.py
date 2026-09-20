@@ -47,6 +47,7 @@ from chamber.browser.devtools import PageMonitor
 from chamber.browser.discovery import BrowserBuild
 from chamber.clipboard import Clipboard
 from chamber.config import ChamberConfig
+from chamber.display import ChamberDesk, StatusGetter, StatusParser
 from chamber.dom import serialize
 from chamber.dom.model import Snapshot
 from chamber.dom.snapshot import ExtractOptions, capture
@@ -134,6 +135,18 @@ class Chamber:
         # only changing how the bar looks.
         self.controlled = False
         self._control_listeners: list = []
+        self._overlay_prefs: dict[str, object] = {
+            "corner": "bottom-right",
+            "view": "activity",
+            "expanded": False,
+            "width": 360,
+            "height": 230,
+        }
+        # The companion is separate from the page overlay. It owns the durable
+        # status/activity read-out while the old overlay remains available as the
+        # browser-local cursor, highlight, and handoff tether.
+        self.display: ChamberDesk | None = None
+        self._display_status_adapters: list[tuple[StatusGetter, StatusParser, bool]] = []
 
         # Optional screenshot-describing model. Attached here rather than owned by
         # the loop so `screenshot` describes the image for any caller — the CLI
@@ -167,11 +180,19 @@ class Chamber:
             # overlay and the readiness observer miss the load they most need to see.
             ch = cls(config, pw, context, result.build, run_id)
             await install_overlay(
-                context, ch._on_control, skip_hosts=config.browser.overlay_skip_hosts
+                context,
+                ch._on_control,
+                ch._on_overlay_prefs,
+                skip_hosts=config.browser.overlay_skip_hosts,
+                show_panel=config.display.mode == "page",
             )
             await ready_mod.install(context)
 
             await ch._adopt_existing()
+            # The companion is lazy with the browser, but once the browser exists
+            # it is the default read-out for every workflow: the built-in loop,
+            # MCP calls, and library users all see the same display surface.
+            await ch.start_display()
             try:
                 yield ch
             finally:
@@ -203,6 +224,9 @@ class Chamber:
         self._current = next(iter(self._tabs))
 
     async def close(self) -> None:
+        if self.display is not None:
+            with contextlib.suppress(Exception):
+                await self.display.close()
         for tab in list(self._tabs.values()):
             with contextlib.suppress(Exception):
                 await tab.monitor.close()
@@ -216,6 +240,49 @@ class Chamber:
                 await self.vision.__aexit__(None, None, None)
         with contextlib.suppress(Exception):
             await self._context.close()
+
+    async def start_display(self) -> bool:
+        """Start Chamber Desk when the configured display mode is ``window``."""
+        if self.config.display.mode != "window":
+            return False
+        if self.display is None:
+            self.display = ChamberDesk(
+                self._pw,
+                self.build,
+                headless=self.config.browser.headless,
+                on_action=self._on_display_action,
+            )
+            for getter, parser, prepend in self._display_status_adapters:
+                self.display.adapter.register_status_adapter(
+                    getter, parser, prepend=prepend
+                )
+        return await self.display.start()
+
+    def register_display_status_adapter(
+        self,
+        getter: StatusGetter,
+        parser: StatusParser,
+        *,
+        prepend: bool = True,
+    ) -> None:
+        """Add a getter/parser pair to the display without touching the loop.
+
+        Registration is safe before or after the window opens. This is the public
+        extension point for workflow-specific status functions.
+        """
+        self._display_status_adapters.append((getter, parser, prepend))
+        if self.display is not None:
+            self.display.adapter.register_status_adapter(getter, parser, prepend=prepend)
+
+    def _display_event(self, event: str, payload: dict[str, Any] | None = None) -> None:
+        if self.display is not None:
+            self.display.handle(event, payload)
+
+    async def _on_display_action(self, action: str) -> None:
+        if action == "take_control":
+            await self.take_control(True)
+        elif action == "give_control":
+            await self.take_control(False)
 
     # ---------------------------------------------------------------------- tabs
 
@@ -416,6 +483,7 @@ class Chamber:
         wait: bool = True,
         quiet: bool = False,
         check_challenge: bool = True,
+        display_event: bool = True,
     ) -> Snapshot:
         """Take a fresh look at the current tab.
 
@@ -470,8 +538,17 @@ class Chamber:
             if tab["id"] == self._current:
                 tab["title"] = snap.title
         self.last_snapshot = snap
+        if display_event:
+            self._display_event(
+                "observe",
+                {
+                    "url": snap.url,
+                    "controls": len(snap.elements),
+                    "tabs": self.tab_summary(),
+                    "clips": [c.preview(80) for c in self.clipboard],
+                },
+            )
         return snap
-
     def render(self, **kwargs: Any) -> str:
         """The last observation, as the model would read it."""
         if self.last_snapshot is None:
@@ -480,22 +557,49 @@ class Chamber:
 
     # ------------------------------------------------------------------ acting
 
-    async def act(self, action: AnyAction | dict[str, Any]) -> ActionResult:
+    async def act(
+        self,
+        action: AnyAction | dict[str, Any],
+        *,
+        display_event: bool = True,
+    ) -> ActionResult:
         """Validate and execute one action.
 
         Accepts a raw dict so callers — including the MCP server and hand-written
         scripts — never have to import the schema.
         """
         if isinstance(action, dict):
+            raw_action = action.get("action", "?")
             try:
                 action = parse_action(action)
             except Exception as exc:
-                return ActionResult.failure(
+                result = ActionResult.failure(
                     Outcome.INVALID_ACTION,
-                    str(action.get("action", "?")),
+                    str(raw_action),
                     _explain_validation(exc),
                 )
-        return await self._executor.run(action)
+                if display_event:
+                    self._display_event(
+                        "action",
+                        {
+                            "name": str(raw_action),
+                            "ok": False,
+                            "detail": result.message,
+                        },
+                    )
+                return result
+        result = await self._executor.run(action)
+        if display_event:
+            self._display_event(
+                "action",
+                {
+                    "name": action.action,
+                    "ok": result.ok,
+                    "detail": result.message,
+                    "why": action.why,
+                },
+            )
+        return result
 
     # ------------------------------------------------------------------ output
 
@@ -516,6 +620,10 @@ class Chamber:
 
         if scale >= 0.999:
             await self.page.screenshot(path=str(out), full_page=full_page)
+            self._display_event(
+                "screenshot",
+                {"screenshot": str(out), "full_page": full_page},
+            )
             return out
 
         try:
@@ -537,6 +645,10 @@ class Chamber:
         except Exception as exc:
             log.debug("scaled capture failed (%s); falling back to full size", exc)
             await self.page.screenshot(path=str(out), full_page=full_page)
+        self._display_event(
+            "screenshot",
+            {"screenshot": str(out), "full_page": full_page, "scale": scale},
+        )
         return out
 
     async def look(self, question: str = "", *, full_page: bool = False) -> tuple[Path, str]:
@@ -548,19 +660,32 @@ class Chamber:
         screenshots it cannot see, which is exactly the loop this avoids.
         """
         path = await self.screenshot(full_page=full_page, scale=self.config.loop.vision_scale)
+        self._display_event(
+            "vision_request",
+            {"screenshot": str(path), "question": question or "What is on screen?"},
+        )
         if self.vision is None:
-            return path, (
+            answer = (
                 "(no vision model is configured, so nobody looked at this image. "
                 "Set CHAMBER_VISION_MODEL to enable it. Rely on the control list "
                 "and page content instead — do not take more screenshots.)"
             )
-        return path, await self.vision.look(path, question)
+            self._display_event(
+                "vision", {"screenshot": str(path), "question": question, "text": answer}
+            )
+            return path, answer
+        answer = await self.vision.look(path, question)
+        self._display_event(
+            "vision", {"screenshot": str(path), "question": question, "text": answer}
+        )
+        return path, answer
 
     # ---------------------------------------------------------- handing over
 
     def _on_control(self, controlled: bool) -> None:
         """The Take Control button, from the page."""
         self.controlled = controlled
+        self._display_event("controlled", {"taken": controlled, "source": "browser"})
         log.info("human %s control", "took" if controlled else "gave back")
         for listener in self._control_listeners:
             try:
@@ -568,20 +693,35 @@ class Chamber:
             except Exception:
                 log.debug("control listener raised", exc_info=True)
 
+    def _on_overlay_prefs(
+        self, patch: dict[str, object] | None = None
+    ) -> dict[str, object]:
+        """Keep panel choices stable as the active tab navigates across origins."""
+        if patch:
+            allowed = {"corner", "view", "expanded", "width", "height", "visible"}
+            self._overlay_prefs.update({k: v for k, v in patch.items() if k in allowed})
+        return dict(self._overlay_prefs)
+
     def on_control_change(self, listener) -> None:
         self._control_listeners.append(listener)
 
     async def take_control(self, controlled: bool = True) -> None:
         """Hand the browser over (or take it back) from Python."""
+        display_state = (
+            self.display.adapter.state.controlled if self.display is not None else None
+        )
         self.controlled = controlled
         await self.overlay.set_control(controlled)
-
+        if self.display is not None and display_state == self.display.adapter.state.controlled:
+            self._display_event("controlled", {"taken": controlled, "source": "display"})
     async def wait_while_controlled(self, poll_s: float = 0.4) -> float:
         """Block for as long as the human holds control. Returns seconds waited.
 
-        Polling rather than an event because the button lives in the page and a
-        navigation re-creates the overlay; the page is the authority on whether
-        the human still has it, and asking is cheap.
+        The Python flag is authoritative because navigation creates a fresh page
+        overlay. A fresh overlay is put back into the paused state; it must not
+        silently resume the agent merely because the human followed a link while
+        they had control. Clicking Give control back updates the flag immediately
+        through the exposed binding.
         """
         if not self.controlled:
             return 0.0
@@ -589,11 +729,11 @@ class Chamber:
         await self.overlay.say("paused", "Agent stopped. Press Give control back when ready.", "plan")
         while self.controlled:
             await asyncio.sleep(poll_s)
-            # The binding may have been lost (a page that blocked it, a crash);
-            # re-reading the page keeps a stuck pause from being permanent.
+            # Navigation mounts a new panel with its default state. Reassert the
+            # handoff on that page; never interpret a remount as consent to resume.
             with contextlib.suppress(Exception):
                 if not await self.overlay.is_controlled():
-                    self.controlled = False
+                    await self.overlay.set_control(True)
         return time.monotonic() - started
 
     # ------------------------------------------------------------ human in loop
@@ -601,6 +741,22 @@ class Chamber:
     async def ask_human(
         self, question: str, *, reason: str = "blocked", resume_when: str = "", timeout_s: float = 300.0
     ) -> str:
+        heading = {
+            "captcha": "Captcha — over to you",
+            "login": "Sign-in needed",
+            "payment": "Payment step — your call",
+            "ambiguous": "Need a decision",
+            "confirm": "Confirm before I continue",
+        }.get(reason, "Your turn")
+        self._display_event(
+            "human_request",
+            {
+                "heading": heading,
+                "question": question,
+                "reason": reason,
+                "resume_when": resume_when,
+            },
+        )
         result = await hand_off(
             self.page,
             self.overlay,
@@ -608,6 +764,14 @@ class Chamber:
             reason=reason,
             resume_when=resume_when,
             timeout_s=timeout_s,
+        )
+        self._display_event(
+            "human_resolved",
+            {
+                "resolved": result.resolved,
+                "reason": result.reason,
+                "waited_s": result.waited_s,
+            },
         )
         if result.resolved:
             self.last_snapshot = None

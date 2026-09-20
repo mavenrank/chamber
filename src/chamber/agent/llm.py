@@ -87,6 +87,20 @@ class Message:
         parts.append({"type": "text", "text": self.content})
         return {"role": self.role, "content": parts}
 
+    def to_responses(self) -> dict[str, Any]:
+        """An input item for OpenAI's Responses API."""
+        if not self.images:
+            return {"role": self.role, "content": self.content}
+        parts: list[dict[str, Any]] = [{"type": "input_text", "text": self.content}]
+        parts.extend(
+            {
+                "type": "input_image",
+                "image_url": f"data:image/png;base64,{b64}",
+            }
+            for b64 in self.images
+        )
+        return {"role": self.role, "content": parts}
+
 
 @dataclass(slots=True)
 class ToolCall:
@@ -102,6 +116,7 @@ class LLMResponse:
     input_tokens: int = 0
     output_tokens: int = 0
     stop_reason: str = ""
+    reasoning_summary: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -173,22 +188,38 @@ class LLM:
     ) -> LLMResponse:
         if not self.config.api_key and self.config.provider == "anthropic":
             raise LLMError("No API key. Set CHAMBER_ANTHROPIC_API_KEY.")
+        if (
+            not self.config.api_key
+            and self.config.provider == "openai"
+            and "api.openai.com" in (self.config.base_url or "")
+        ):
+            raise LLMError(
+                "No OpenAI API key. Set CHAMBER_OPENAI_API_KEY. "
+                "A ChatGPT subscription is not an API credential."
+            )
 
         has_images = any(m.images for m in messages)
 
         if self.config.provider == "anthropic":
             payload, url, headers = self._anthropic_request(system, messages, tools)
             parse = self._parse_anthropic
+        elif self.config.api_style == "responses":
+            payload, url, headers = self._responses_request(system, messages, tools)
+            parse = self._parse_responses
         else:
             payload, url, headers = self._openai_request(system, messages, tools)
             parse = self._parse_openai
 
         sent_tools = bool(tools) and self.config.tool_calling and self._tools_work
         started = time.monotonic()
+        exchange_id = f"{time.time_ns()}-{id(self)}"
         self._notify(
             "llm_request",
+            exchange_id=exchange_id,
             role=self.role,
             model=self.config.model,
+            api_style=self.config.api_style,
+            reasoning_effort=self.config.reasoning_effort,
             system_chars=len(system),
             messages=len(messages),
             prompt_chars=sum(len(m.content) for m in messages),
@@ -197,6 +228,18 @@ class LLM:
             last_user=next(
                 (m.content for m in reversed(messages) if m.role == "user"), ""
             )[-2000:],
+            request={
+                "system": system,
+                "messages": [
+                    {
+                        "role": m.role,
+                        "content": m.content,
+                        "images": len(m.images),
+                    }
+                    for m in messages
+                ],
+                "tools": tools if sent_tools else [],
+            },
         )
         try:
             data = await self._post(url, payload, headers)
@@ -205,7 +248,12 @@ class LLM:
             # disagreeing about the image encoding rather than a real failure.
             # Flip the style once and retry; the choice sticks for the session so
             # the cost is paid at most once.
-            if has_images and self.config.provider != "anthropic" and self._image_style == "object":
+            if (
+                has_images
+                and self.config.provider != "anthropic"
+                and self.config.api_style == "chat_completions"
+                and self._image_style == "object"
+            ):
                 log.info("image request rejected; retrying with the string image encoding")
                 self._image_style = "string"
                 payload, url, headers = self._openai_request(system, messages, tools)
@@ -217,7 +265,10 @@ class LLM:
                 # than failing the run. Remembered for the session.
                 log.warning("endpoint rejected tools; falling back to JSON-in-text")
                 self._tools_work = False
-                payload, url, headers = self._openai_request(system, messages, None)
+                if self.config.api_style == "responses":
+                    payload, url, headers = self._responses_request(system, messages, None)
+                else:
+                    payload, url, headers = self._openai_request(system, messages, None)
                 data = await self._post(url, payload, headers)
             else:
                 raise
@@ -226,10 +277,12 @@ class LLM:
         self.total_output += response.output_tokens
         self._notify(
             "llm_response",
+            exchange_id=exchange_id,
             role=self.role,
             model=self.config.model,
             seconds=time.monotonic() - started,
-            text=response.text[:2000],
+            text=response.text,
+            reasoning_summary=response.reasoning_summary,
             tool_calls=[
                 {"name": c.name, "arguments": c.arguments} for c in response.tool_calls
             ],
@@ -306,6 +359,43 @@ class LLM:
         if self.config.api_key:
             headers["authorization"] = f"Bearer {self.config.api_key}"
         return payload, f"{base}/chat/completions", headers
+
+    def _responses_request(
+        self, system: str, messages: list[Message], tools: list[dict[str, Any]] | None
+    ) -> tuple[dict[str, Any], str, dict[str, str]]:
+        """Build an official OpenAI Responses API request.
+
+        This path intentionally lives beside, rather than replacing, the existing
+        compatible Chat Completions path used by OpenCode and local servers.
+        """
+        base = (self.config.base_url or "https://api.openai.com/v1").rstrip("/")
+        payload: dict[str, Any] = {
+            "model": self.config.model,
+            "instructions": system,
+            "input": [m.to_responses() for m in messages],
+            "max_output_tokens": self.config.max_tokens,
+        }
+        if self.config.reasoning_effort:
+            payload["reasoning"] = {
+                "effort": self.config.reasoning_effort,
+                # This is an API-provided summary, not private chain-of-thought.
+                "summary": "auto",
+            }
+        if tools and self.using_tools:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "name": t["name"],
+                    "description": t["description"],
+                    "parameters": t["input_schema"],
+                    "strict": False,
+                }
+                for t in tools
+            ]
+        headers = {"content-type": "application/json"}
+        if self.config.api_key:
+            headers["authorization"] = f"Bearer {self.config.api_key}"
+        return payload, f"{base}/responses", headers
 
     # ------------------------------------------------------------------- wire
 
@@ -404,5 +494,47 @@ class LLM:
             input_tokens=usage.get("prompt_tokens", 0),
             output_tokens=usage.get("completion_tokens", 0),
             stop_reason=choices[0].get("finish_reason", ""),
+            raw=data,
+        )
+
+    @staticmethod
+    def _parse_responses(data: dict[str, Any]) -> LLMResponse:
+        text_parts: list[str] = []
+        summary_parts: list[str] = []
+        calls: list[ToolCall] = []
+        for item in data.get("output") or []:
+            item_type = item.get("type")
+            if item_type == "message":
+                for content in item.get("content") or []:
+                    if content.get("type") == "output_text":
+                        text_parts.append(content.get("text", ""))
+            elif item_type == "function_call":
+                raw_args = item.get("arguments") or "{}"
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except json.JSONDecodeError:
+                    args = {"_raw": raw_args}
+                calls.append(
+                    ToolCall(
+                        name=item.get("name", ""),
+                        arguments=args,
+                        call_id=item.get("call_id", ""),
+                    )
+                )
+            elif item_type == "reasoning":
+                for part in item.get("summary") or []:
+                    if isinstance(part, dict) and part.get("text"):
+                        summary_parts.append(part["text"])
+
+        usage = data.get("usage") or {}
+        status = data.get("status", "")
+        incomplete = data.get("incomplete_details") or {}
+        return LLMResponse(
+            text="\n".join(text_parts).strip(),
+            tool_calls=calls,
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+            stop_reason=incomplete.get("reason", "") if status == "incomplete" else status,
+            reasoning_summary="\n".join(summary_parts).strip(),
             raw=data,
         )
