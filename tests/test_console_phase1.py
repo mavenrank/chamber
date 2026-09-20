@@ -83,6 +83,17 @@ def test_console_server_serves_shell_and_api():
         thread.join(timeout=5)
 
 
+def test_human_note_and_paused_events_render():
+    adapter = DisplayAdapter()
+    note = adapter.handle("human_note", {"step": 3, "text": "scroll slower"})
+    assert note["events"][-1]["title"] == "Human note"
+    assert note["current"]["title"] == "Reading your note"
+    paused = adapter.handle("paused", {"step": 3, "taken": True})
+    assert paused["events"][-1]["title"] == "Loop paused"
+    resumed = adapter.handle("paused", {"step": 3, "taken": False, "seconds": 4.2})
+    assert resumed["events"][-1]["title"] == "Loop resumed"
+
+
 def test_queries_are_read_only_and_shaped():
     runs = q.list_runs(limit=5)
     assert isinstance(runs, list)

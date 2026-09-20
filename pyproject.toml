@@ -1,6 +1,6 @@
 [project]
 name = "chamber"
-version = "0.11.0"
+version = "0.12.0"
 description = "A headed browser an LLM can drive in the open — visible cursor, visible reasoning, durable actions"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"

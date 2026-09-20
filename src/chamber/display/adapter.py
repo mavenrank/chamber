@@ -433,6 +433,8 @@ class DisplayAdapter:
             "controlled",
             "human_request",
             "human_resolved",
+            "human_note",
+            "paused",
             "run_end",
         ):
             parser = getattr(self, f"_parse_{name}")
@@ -741,6 +743,41 @@ class DisplayAdapter:
             state_title="Continuing" if resolved else "Continuing without input",
             state_detail=detail,
             state_tone="active" if resolved else "attention",
+        )
+
+    def _parse_human_note(self, p: Mapping[str, Any]) -> _Normalized:
+        text = _clip(p.get("text", ""), 4_000)
+        return _Normalized(
+            title="Human note",
+            detail=text or "An empty note arrived.",
+            source="human",
+            tone="attention",
+            step=self._step(p),
+            details={"text": text, "visibility": "goes to the model with the next observation"},
+            state_title="Reading your note",
+            state_detail=text or "A note arrived.",
+            state_tone="attention",
+        )
+
+    def _parse_paused(self, p: Mapping[str, Any]) -> _Normalized:
+        taken = bool(p.get("taken"))
+        waited = p.get("seconds")
+        detail = "The loop is held from Chamber Console"
+        if waited is not None:
+            detail += f" (was held {float(waited):.1f}s)"
+        if not taken:
+            detail = "The loop is running again" + (
+                f" (was held {float(waited):.1f}s)" if waited is not None else ""
+            )
+        return _Normalized(
+            title="Loop paused" if taken else "Loop resumed",
+            detail=detail,
+            source="human",
+            tone="attention" if taken else "active",
+            step=self._step(p),
+            state_title="Paused for you" if taken else "Resuming",
+            state_detail=detail,
+            state_tone="attention" if taken else "active",
         )
 
     def _parse_run_end(self, p: Mapping[str, Any]) -> _Normalized:

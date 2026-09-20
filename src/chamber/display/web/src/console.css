@@ -220,6 +220,13 @@ code { font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
 }
 .search input { flex: 1; border: 0; outline: 0; background: transparent; color: var(--ink); font: inherit; font-size: 13px; }
 .search input::placeholder { color: var(--muted); }
+.run-pick {
+  flex: 1; border: 0; outline: 0; background: transparent; color: var(--ink);
+  font: inherit; font-size: 13px; cursor: pointer;
+}
+.run-pick option { background: var(--surface); color: var(--ink); }
+.feed-line { padding: 5px 2px; border-top: 1px solid var(--line); font-size: 13px; }
+.feed-line:first-child { border-top: 0; }
 
 .field { margin: 0 0 14px; }
 .field-label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }

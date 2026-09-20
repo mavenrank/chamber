@@ -13,6 +13,37 @@ the trace database with `chamber trace`.
 
 ---
 
+## [0.12.0] — 2026-09-20
+
+### Live runs and a human mailbox
+
+Console stops polling blind. The server tails the WAL-mode trace store over
+SSE, and a file mailbox connects the Console to the loop across processes:
+file a note, hold/release the run, watch rows land as they are written.
+
+**Added**
+
+- **`/api/live` event stream** — stdlib SSE tailing steps, actions, model
+  exchanges (slimmed to role/model/timing) and visits per run, with
+  row-watermark cursors so reconnects are lossless. No new dependency:
+  one-way server→browser sync doesn't need WebSockets.
+- **File mailbox** (`inbox.py`) — `runs/<id>/inbox/new/*.json` claimed
+  atomically into `done/`; `control.json` carries the pause flag. Path
+  traversal rejected; empty notes rejected.
+- **Loop drain** — pause holds at the step boundary (beside the `controlled`
+  check); notes join the step's feedback so the model reads them with the
+  fresh page. New `human_note` / `paused` display events (Desk shows them
+  too) plus terminal transcript lines.
+- **`POST /api/inbox`, `POST /api/pause`, `run_state`** — the write half of
+  the Console, localhost-only like everything else here.
+- **Console Live view** — run picker, streaming feed, pause/resume, note box
+  with pending-notes list. Refresh stays as the durable fallback.
+
+**Verified** — 148 tests green, `ruff check` clean, live POST/SSE pinged
+against the real server and trace store.
+
+---
+
 ## [0.11.0] — 2026-09-20
 
 ### Chamber Console: read-only sessions shell over the trace store

@@ -450,6 +450,13 @@ async def _run_task(cfg: ChamberConfig, task: str, url: str | None):
                 console.print("[yellow]vision model did not preload; it will load on first use[/yellow]")
         elif event == "parse_retry":
             console.print(f"  [yellow]↻ reply unreadable, retrying ({payload['attempt']})[/yellow]")
+        elif event == "human_note" and payload.get("text"):
+            console.print(f"  [bold yellow]✎ note:[/bold yellow] [italic]{payload['text'][:200]}[/italic]")
+        elif event == "paused":
+            if payload.get("taken"):
+                console.print("  [yellow]⏸ paused from Chamber Console — resume there[/yellow]")
+            else:
+                console.print("  [green]▶ resumed[/green]")
 
     async with Chamber.open(cfg) as ch:
         console.print(f"[dim]{ch.build.label} · profile {cfg.profile}[/dim]")

@@ -31,6 +31,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from chamber import inbox
 from chamber.actions.result import ActionResult, format_batch
 from chamber.actions.schema import Done, tool_schemas
 from chamber.agent import parse, prompt
@@ -193,6 +194,23 @@ class Agent:
                 # The person almost certainly navigated or clicked while they had
                 # it, so every remembered ref is meaningless now.
                 self.ch.last_snapshot = None
+
+            # --- human mailbox (Phase 2) --------------------------------
+            # File-based because the Console lives in another process. A pause
+            # holds the loop here; notes join the step's feedback so the model
+            # reads them beside the fresh page, not instead of it.
+            if inbox.is_paused(self.ch.run_id):
+                self._emit("paused", step=n, taken=True)
+                waited = await self._wait_while_paused()
+                self._emit("paused", step=n, taken=False, seconds=waited)
+                self.ch.last_snapshot = None
+            for note in inbox.claim_notes(self.ch.run_id):
+                text = str(note.get("text", "")).strip()
+                if not text:
+                    continue
+                self._emit("human_note", step=n, text=text)
+                line = f"Human note: {text}"
+                feedback = f"{feedback}\n\n{line}" if feedback else line
 
             # --- observe ---------------------------------------------------
             snap = await self.ch.observe(display_event=False)
@@ -483,6 +501,18 @@ class Agent:
             output_tokens=self.llm.total_output,
             stopped_because=stopped_because,
         )
+
+    async def _wait_while_paused(self, poll_s: float = 0.4) -> float:
+        """Block while a human holds the loop from the Console. Returns seconds."""
+        if not inbox.is_paused(self.ch.run_id):
+            return 0.0
+        started = time.monotonic()
+        await self.ch.overlay.say(
+            "paused", "Paused from Chamber Console. Resume there to continue.", "plan"
+        )
+        while inbox.is_paused(self.ch.run_id):
+            await asyncio.sleep(poll_s)
+        return time.monotonic() - started
 
     # ----------------------------------------------------------------- decide
 

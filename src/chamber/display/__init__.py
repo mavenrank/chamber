@@ -20,6 +20,7 @@ from chamber.display.queries import (
     get_run,
     list_profiles,
     list_runs,
+    run_state,
 )
 from chamber.display.status import EventStatusGetter, FunctionStatusParser
 from chamber.display.window import ChamberDesk
@@ -40,4 +41,5 @@ __all__ = [
     "get_run",
     "list_profiles",
     "list_runs",
+    "run_state",
 ]

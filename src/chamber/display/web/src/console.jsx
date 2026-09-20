@@ -57,7 +57,7 @@ async function query(op, args = {}) {
 
 const NAV = [
   { id: "sessions", label: "Sessions", icon: Database, phase: 1 },
-  { id: "live", label: "Live", icon: Radio, phase: 2 },
+  { id: "live", label: "Live", icon: Radio, phase: 1 },
   { id: "environment", label: "Environment", icon: Monitor, phase: 1 },
   { id: "profiles", label: "Profiles", icon: Globe2, phase: 1 },
   { id: "models", label: "Models", icon: Boxes, phase: 1 },
@@ -257,11 +257,11 @@ function KV({ label, children }) {
   );
 }
 
-function Placeholder({ title, children }) {
+function Placeholder({ title, phase = 3, children }) {
   return (
     <div className="placeholder">
       <h3>
-        {title} <Badge tone="warn">Phase 2</Badge>
+        {title} <Badge tone="warn">Phase {phase}</Badge>
       </h3>
       <div className="muted">{children}</div>
     </div>
@@ -417,10 +417,6 @@ function SessionsView({ runs, selected, detail, booted, onSelect, search, onSear
                     ))}
                   </tbody>
                 </table>
-                <Placeholder title="Live view">
-                  Open Desk at <code>/?run_id={selected}</code> · pause/resume · send the model a
-                  note mid-run.
-                </Placeholder>
               </>
             )}
             {tab === "sources" && (
@@ -461,8 +457,8 @@ function SessionsView({ runs, selected, detail, booted, onSelect, search, onSear
               </ol>
             )}
             {tab === "overview" && (
-              <Placeholder title="Compare">
-                Side-by-side against another run. <Badge tone="warn">Phase 3</Badge>
+              <Placeholder title="Compare" phase={3}>
+                Side-by-side against another run.
               </Placeholder>
             )}
           </>
@@ -472,21 +468,218 @@ function SessionsView({ runs, selected, detail, booted, onSelect, search, onSear
   );
 }
 
-function LiveView() {
+async function post(path, payload) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return res.json();
+}
+
+function rowKey(r) {
+  return `${r.kind}:${r.id ?? r.rowid}`;
+}
+
+function FeedLine({ row }) {
+  if (row.kind === "step") {
+    return (
+      <div>
+        <strong>step {row.n}</strong> · {row.url || "—"}
+        {row.thought && <div className="muted">“{String(row.thought).slice(0, 140)}”</div>}
+      </div>
+    );
+  }
+  if (row.kind === "action") {
+    return (
+      <div>
+        {row.outcome === "ok" ? "✓" : "✗"} {row.name} — {String(row.message || "").slice(0, 100)}
+      </div>
+    );
+  }
+  if (row.kind === "exchange") {
+    const calls = (row.tool_calls || []).map((c) => c.name).join(", ");
+    return (
+      <div>
+        {row.role} · {row.model}
+        {row.text && <div className="muted">{String(row.text).slice(0, 140)}</div>}
+        {calls && <div className="muted">→ {calls}</div>}
+      </div>
+    );
+  }
+  return <div className="muted">· {row.url || row.canonical || "visit"}</div>;
+}
+
+function LiveView({ runs }) {
+  const [runId, setRunId] = useState(null);
+  const [feed, setFeed] = useState([]);
+  const [paused, setPaused] = useState(false);
+  const [pending, setPending] = useState([]);
+  const [note, setNote] = useState("");
+  const [stream, setStream] = useState("idle"); // idle | live | down
+  const [sendState, setSendState] = useState("");
+  const seen = React.useRef(new Set());
+
+  useEffect(() => {
+    if (runId || runs.length === 0) return;
+    const liveRun = runs.find((r) => !r.ended_at) || runs[0];
+    setRunId(liveRun.id);
+  }, [runs, runId]);
+
+  useEffect(() => {
+    if (!runId) return;
+    setFeed([]);
+    seen.current = new Set();
+    setStream("idle");
+    let closed = false;
+    query("run_state", { run_id: runId }).then((res) => {
+      if (closed || !res?.ok) return;
+      setPaused(!!res.paused);
+      setPending(res.pending_notes || []);
+    });
+    // Same-origin server stream. EventSource reconnects on its own; the
+    // seen-set makes redelivery a no-op.
+    let es = null;
+    try {
+      es = new EventSource(`/api/live?run_id=${encodeURIComponent(runId)}&cursor=0:0:0:0`);
+    } catch {
+      setStream("down");
+      return undefined;
+    }
+    es.onopen = () => !closed && setStream("live");
+    es.onerror = () => !closed && setStream("down");
+    es.addEventListener("tick", (e) => {
+      if (closed) return;
+      let batch = null;
+      try {
+        batch = JSON.parse(e.data);
+      } catch {
+        return;
+      }
+      setPaused(!!batch.paused);
+      setPending(batch.pending_notes || []);
+      const fresh = (batch.rows || []).filter((r) => {
+        const k = rowKey(r);
+        if (seen.current.has(k)) return false;
+        seen.current.add(k);
+        return true;
+      });
+      if (fresh.length > 0) setFeed((prev) => [...prev.slice(-300), ...fresh]);
+    });
+    return () => {
+      closed = true;
+      es.close();
+    };
+  }, [runId]);
+
+  const sendNote = async () => {
+    const text = note.trim();
+    if (!text || !runId) return;
+    setSendState("sending…");
+    try {
+      const res = await post("/api/inbox", { run_id: runId, text });
+      setSendState(res?.ok ? "filed ✓" : `failed: ${res?.error || "?"}`);
+      if (res?.ok) setNote("");
+    } catch (err) {
+      setSendState(`failed: ${String(err?.message || err)}`);
+    }
+    setTimeout(() => setSendState(""), 2500);
+  };
+
+  const togglePause = async () => {
+    if (!runId) return;
+    setPaused(!paused);
+    try {
+      await post("/api/pause", { run_id: runId, paused: !paused });
+    } catch {
+      setPaused(paused);
+    }
+  };
+
   return (
-    <Card title="Live" icon={Radio} action={<Badge tone="warn">Phase 2</Badge>}>
-      <Placeholder title="Event stream">
-        WebSocket push from <code>DisplayAdapter.handle()</code> — Desk snapshots in any browser,
-        no Refresh needed.
-      </Placeholder>
-      <Placeholder title="Controls">
-        Take / give control · stop + resume the loop · human-note inbox injected as the next
-        observation.
-      </Placeholder>
-      <Placeholder title="New session">
-        Task box + profile picker + start. Today's equivalent is a terminal.
-      </Placeholder>
-    </Card>
+    <div className="split" style={{ gridTemplateColumns: "minmax(0, 1fr) 320px" }}>
+      <Card
+        title="Live stream"
+        icon={Radio}
+        action={
+          stream === "live" ? (
+            <Badge tone="live">live</Badge>
+          ) : stream === "down" ? (
+            <Badge tone="warn">reconnecting…</Badge>
+          ) : (
+            <Badge>connecting…</Badge>
+          )
+        }
+      >
+        <div className="search">
+          <select
+            value={runId || ""}
+            onChange={(e) => setRunId(e.target.value)}
+            aria-label="Watch a run"
+            className="run-pick"
+          >
+            {runs.map((r) => (
+              <option key={r.id} value={r.id}>
+                {!r.ended_at ? "● " : ""}{r.id} — {(r.task || "").slice(0, 50)}
+              </option>
+            ))}
+          </select>
+        </div>
+        {paused && (
+          <div className="notice" style={{ margin: "0 0 8px" }}>
+            Paused — the loop holds at the next step boundary.
+          </div>
+        )}
+        <ul className="run-list">
+          {feed.map((r) => (
+            <li key={rowKey(r)} className="feed-line">
+              <FeedLine row={r} />
+            </li>
+          ))}
+        </ul>
+        {feed.length === 0 && (
+          <p className="muted">waiting for rows — new steps land here as the loop writes them</p>
+        )}
+      </Card>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        <Card title="Loop control" icon={Settings}>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <Button variant={paused ? "default" : "outline"} size="sm" onClick={togglePause}>
+              {paused ? "▶ Resume" : "⏸ Pause"}
+            </Button>
+          </div>
+          <Field label="Send the model a note" hint="Filed to the run mailbox; read at the next step.">
+            <div className="search" style={{ marginBottom: 6 }}>
+              <input
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder="e.g. compare prices first…"
+                aria-label="Note text"
+                onKeyDown={(e) => e.key === "Enter" && sendNote()}
+              />
+            </div>
+            <Button variant="outline" size="sm" onClick={sendNote}>
+              File note
+            </Button>{" "}
+            <span className="muted">{sendState}</span>
+          </Field>
+          {pending.length > 0 && (
+            <>
+              <h3>Waiting ({pending.length})</h3>
+              <ul className="plain-list">
+                {pending.map((n) => (
+                  <li key={n.id}>✎ {n.text}</li>
+                ))}
+              </ul>
+            </>
+          )}
+        </Card>
+        <Card title="New session" icon={Boxes} action={<Badge tone="warn">Phase 3</Badge>}>
+          <p className="muted">Task box + profile picker + start. Today's equivalent is a terminal.</p>
+        </Card>
+      </div>
+    </div>
   );
 }
 
@@ -662,14 +855,15 @@ function SettingsView({ theme, setTheme }) {
                 <tr>
                   <td>query API</td>
                   <td>
-                    <code>/api/query?op=list_runs|get_run|list_profiles|get_environment</code>
+                    <code>/api/query?op=list_runs|get_run|run_state|list_profiles|get_environment</code>
                   </td>
                 </tr>
               </tbody>
             </table>
-            <Placeholder title="Live sync">
-              WebSocket push replacing Refresh. <Badge tone="warn">Phase 2</Badge>
-            </Placeholder>
+            <p className="muted">
+              Live sync: <code>/api/live</code> SSE tail (stdlib, reconnects on its own) plus{" "}
+              <code>POST /api/inbox</code> and <code>POST /api/pause</code>.
+            </p>
           </Card>
         )}
         {section === "data" && (
@@ -844,7 +1038,7 @@ function App() {
             onAuto={setAuto}
           />
         )}
-        {view === "live" && <LiveView />}
+          {view === "live" && <LiveView runs={runs} />}
         {view === "environment" && <EnvironmentView env={env} booted={booted} />}
         {view === "profiles" && <ProfilesView env={env} booted={booted} />}
         {view === "models" && <ModelsView env={env} booted={booted} />}

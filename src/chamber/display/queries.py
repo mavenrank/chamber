@@ -66,6 +66,20 @@ def build_session_block(config: Any, build: Any, run_id: str) -> dict[str, objec
     }
 
 
+def run_state(run_id: str) -> dict[str, Any]:
+    """One-shot Live-view bootstrap: run row + pause flag + waiting notes."""
+    from chamber import inbox as _box
+    from chamber.trace.store import open_store
+
+    with open_store() as store:
+        run = store.run(_box.check_run_id(run_id))
+    return {
+        "run": run,
+        "paused": _box.is_paused(run_id),
+        "pending_notes": _box.pending_notes(run_id),
+    }
+
+
 def list_runs(limit: int = 20) -> list[dict[str, Any]]:
     """Most recent durable sessions, newest first. Read-only."""
     from chamber.trace.store import open_store

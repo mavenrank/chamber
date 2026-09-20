@@ -217,6 +217,8 @@ class ChamberDesk:
                 return {"ok": True, "runs": _q.list_runs(limit=min(max(limit, 1), 50))}
             if op == "get_run":
                 return {"ok": True, **_q.get_run(str(payload.get("run_id", "")))}
+            if op == "run_state":
+                return {"ok": True, **_q.run_state(str(payload.get("run_id", "")))}
             if op == "list_profiles":
                 return {"ok": True, "profiles": _q.list_profiles()}
             if op == "get_environment":
