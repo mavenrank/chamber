@@ -190,6 +190,45 @@ the same action layer. The browser opens on the first tool call, not at startup.
 | `chamber open <url>` | A plain window — log in by hand; the profile keeps it |
 | `chamber profiles` | List profiles with sizes; `--prune` to clean up |
 | `chamber mcp` | Serve over MCP |
+| `chamber console` | Serve the Chamber Console (sessions, live view, loop control) on localhost |
+
+---
+
+## Chamber Console
+
+Sessions, session detail, environment, profiles and models in any browser —
+read from the trace store, so in-flight runs show up too. Localhost only.
+
+```powershell
+cd C:\path\to\chamber
+uv sync                                  # once / after dep changes
+uv run --no-sync chamber console         # → http://127.0.0.1:5192/console.html
+```
+
+`--no-sync` matters: a bare `uv run` can block resolving headless — the venv
+is already managed by `uv sync`. The Live tab streams `/api/live`, files
+notes via `POST /api/inbox`, and holds/releases the loop via `POST /api/pause`;
+supervised runs spawn with `POST /api/runs` and inherit this shell's
+environment. UI work lives in `src/chamber/display/web` (Bun):
+`bun run dev -- --port 5191 --strictPort` to iterate,
+`bun run build:console` to rebuild what the server serves.
+
+Free-tier example (OpenRouter) for a supervised-run backend — the child
+inherits the server's environment, so set it where you launch `console`:
+
+```powershell
+$env:CHAMBER_OPENAI_BASE_URL = "https://openrouter.ai/api/v1"
+$env:CHAMBER_OPENAI_API_KEY = $env:OPENROUTER_API_KEY   # kept in .env, never committed
+$env:CHAMBER_MODEL = "cohere/north-mini-code:free"
+$env:CHAMBER_ORCHESTRATOR_MODEL = "cohere/north-mini-code:free"
+$env:CHAMBER_VISION_MODEL = ""
+$env:CHAMBER_VISION_FALLBACK_MODEL = ""
+```
+
+Verifying supervision end to end: start the server as above, `POST /api/runs`
+with a 5-step `example.com` task, pause mid-run and confirm `paused: true`
+via `run_state`, file a note and confirm it pending, resume, and confirm the
+trace closes cleanly with steps recorded.
 
 ---
 

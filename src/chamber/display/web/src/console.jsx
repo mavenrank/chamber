@@ -9,6 +9,7 @@ import {
   ListChecks,
   Monitor,
   Moon,
+  Play,
   Radio,
   RefreshCw,
   Search,
@@ -182,9 +183,9 @@ function Badge({ tone = "muted", children }) {
   return <span className={`badge badge-${tone}`}>{children}</span>;
 }
 
-function Card({ title, icon: Icon, action, children }) {
+function Card({ title, icon: Icon, action, children, tint, footer }) {
   return (
-    <section className="card">
+    <section className={`card${tint ? ` ${tint}` : ""}`}>
       {(title || action) && (
         <div className="card-head">
           <h2>
@@ -195,6 +196,7 @@ function Card({ title, icon: Icon, action, children }) {
         </div>
       )}
       <div className="card-body">{children}</div>
+      {footer && <div className="card-foot">{footer}</div>}
     </section>
   );
 }
@@ -215,26 +217,6 @@ function Tabs({ tabs, active, onChange }) {
         </button>
       ))}
     </div>
-  );
-}
-
-function Switch({ checked, onChange, label }) {
-  return (
-    <label className="switch">
-      <button
-        role="switch"
-        aria-checked={checked}
-        aria-label={label}
-        className={checked ? "is-on" : ""}
-        onClick={(e) => {
-          e.preventDefault();
-          onChange(!checked);
-        }}
-      >
-        <span className="knob" />
-      </button>
-      <span>{label}</span>
-    </label>
   );
 }
 
@@ -270,7 +252,265 @@ function Placeholder({ title, phase = 3, children }) {
 
 /* ---------------- views ---------------- */
 
-function SessionsView({ runs, selected, detail, booted, onSelect, search, onSearch, auto, onAuto }) {
+function ExchangeFull({ runId, exchangeId }) {
+  const [open, setOpen] = useState(false);
+  const [body, setBody] = useState(null);
+  const toggle = async () => {
+    if (open) {
+      setOpen(false);
+      return;
+    }
+    setOpen(true);
+    if (body !== null) return;
+    const res = await query("exchange_detail", { run_id: runId, exchange_id: exchangeId });
+    setBody(res?.exchange || { error: res?.error || "not found" });
+  };
+  return (
+    <div>
+      <button className="text-button" onClick={toggle}>
+        {open ? "Hide full exchange" : "View full prompt / response"}
+      </button>
+      {open &&
+        (body === null ? (
+          <p className="muted">loading…</p>
+        ) : body.error ? (
+          <p className="muted">{body.error}</p>
+        ) : (
+          <pre className="log-view">
+            {body.truncated ? "(capped at 256KB per side)\n\n" : ""}
+            {(body.request_json || "").slice(0, 6000)}
+            {"\n\n———— response ————\n\n"}
+            {(body.response_json || "").slice(0, 6000)}
+          </pre>
+        ))}
+    </div>
+  );
+}
+
+function StepCard({ runId, step }) {
+  const ex = step.exchange;
+  const tokens = ex ? (ex.input_tokens || 0) + (ex.output_tokens || 0) : 0;
+  return (
+    <div className="loop-card">
+      <div className="loop-head">
+        <strong>Step {step.n}</strong>
+        <span className="muted">{step.url || "—"}</span>
+        <span className="muted">
+          {step.ms ? `${(step.ms / 1000).toFixed(1)}s` : ""} {tokens ? `· ${tokens} tok` : ""}
+        </span>
+      </div>
+      {step.active_stage && (
+        <div className="loop-stage">
+          ➤ {step.active_stage.stage}{" "}
+          <span className="muted">
+            ({step.active_stage.current + 1}/{step.active_stage.total})
+          </span>
+        </div>
+      )}
+      {step.thought && (
+        <div className="loop-block">
+          <h4>Thought</h4>
+          <p>“{step.thought}”</p>
+        </div>
+      )}
+      {ex && (
+        <div className="loop-block">
+          <h4>
+            Step model · {ex.model} {ex.ms ? `· ${(ex.ms / 1000).toFixed(1)}s` : ""}
+          </h4>
+          {ex.request?.last_user && (
+            <p className="muted">
+              asked: {ex.request.last_user.slice(0, 280)}
+              {ex.request.last_user_truncated ? "… (excerpt)" : ""}
+            </p>
+          )}
+          {ex.text && <p>{ex.text.slice(0, 800)}</p>}
+          {ex.reasoning_summary && (
+            <p className="muted">reasoning: {ex.reasoning_summary.slice(0, 500)}</p>
+          )}
+          {(ex.tool_calls || []).length > 0 && (
+            <p>
+              →{" "}
+              {ex.tool_calls
+                .map((c) => `${c.name}(${Object.entries(c.arguments || {}).slice(0, 3).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(", ")})`)
+                .join(" · ")}
+            </p>
+          )}
+          <ExchangeFull runId={runId} exchangeId={ex.exchange_id} />
+        </div>
+      )}
+      {(step.actions || []).length > 0 && (
+        <div className="loop-block">
+          <h4>Actions</h4>
+          {step.actions.map((a, i) => (
+            <div key={i} className="action-line">
+              {a.outcome === "ok" ? "✓" : "✗"} <strong>{a.name}</strong>
+              {a.why && <span className="muted"> — {a.why.slice(0, 160)}</span>}
+              {a.message && <div className="muted">{a.message.slice(0, 200)}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+      {step.planner_turn?.plan && (
+        <div className="loop-block loop-planner">
+          <h4>Planner · {step.planner_turn.model}</h4>
+          <p className="muted">{step.planner_turn.plan.assessment}</p>
+          <ol className="plan-stages">
+            {step.planner_turn.plan.stages.map((s, i) => (
+              <li key={i} className={i === step.planner_turn.plan.current ? "is-now" : ""}>
+                {i === step.planner_turn.plan.current ? "➤ " : ""}
+                {s}
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
+      {step.planner_turn && !step.planner_turn.plan && step.planner_turn.raw_text && (
+        <div className="loop-block loop-planner">
+          <h4>Planner · {step.planner_turn.model}</h4>
+          <p className="muted">{step.planner_turn.raw_text.slice(0, 500)}</p>
+        </div>
+      )}
+      {(step.vision || []).length > 0 &&
+        step.vision.map((v) => (
+          <div key={v.exchange_id} className="loop-block">
+            <h4>Vision · {v.model}</h4>
+            <p className="muted">Q: {v.question.slice(0, 300)}</p>
+            <p>A: {v.answer.slice(0, 600)}</p>
+          </div>
+        ))}
+    </div>
+  );
+}
+
+function ThoughtLoop({ runId }) {
+  const [loop, setLoop] = useState(null);
+  useEffect(() => {
+    setLoop(null);
+    let live = true;
+    query("thought_loop", { run_id: runId }).then((res) => {
+      if (live && res?.ok) setLoop(res);
+      else if (live) setLoop({ error: res?.error || "not found" });
+    });
+    return () => {
+      live = false;
+    };
+  }, [runId]);
+  if (!loop) return <SkeletonDetail />;
+  if (loop.error) return <p className="muted">{loop.error}</p>;
+  if (!loop.steps || loop.steps.length === 0)
+    return <p className="muted">no steps recorded for this run</p>;
+  return (
+    <div className="loop-feed">
+      {loop.steps.map((s) => (
+        <StepCard key={s.n} runId={runId} step={s} />
+      ))}
+    </div>
+  );
+}
+
+function ThreadStrip({ thread, onSelect }) {
+  if (!thread) return null;
+  const items = [...(thread.ancestors || [])];
+  const hasThread = items.length > 0 || (thread.children || []).length > 0;
+  if (!hasThread && !thread.parent) return null;
+  return (
+    <div className="thread-strip">
+      {items.map((a) => (
+        <span key={a.id}>
+          <button className="text-button" onClick={() => onSelect(a.id)} title={a.task}>
+            ← {a.id.slice(-6)}
+          </button>{" "}
+        </span>
+      ))}
+      <strong>this run</strong>
+      {(thread.children || []).map((c) => (
+        <span key={c.id}>
+          {" "}
+          <button className="text-button" onClick={() => onSelect(c.id)} title={c.task}>
+            {c.id.slice(-6)} →
+          </button>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function CompareBlock({ runs, left }) {
+  const [otherId, setOtherId] = useState("");
+  const [other, setOther] = useState(null);
+  useEffect(() => {
+    if (!otherId) {
+      setOther(null);
+      return;
+    }
+    let live = true;
+    query("get_run", { run_id: otherId }).then((res) => {
+      if (live && res?.ok) setOther(res);
+    });
+    return () => {
+      live = false;
+    };
+  }, [otherId]);
+  useEffect(() => {
+    setOtherId("");
+    setOther(null);
+  }, [left?.run?.id]);
+  const row = (label, a, b) => (
+    <tr key={label}>
+      <td>{label}</td>
+      <td className="wrap">{a}</td>
+      <td className="wrap">{b}</td>
+    </tr>
+  );
+  const steps = (d) => (d?.steps || []).length;
+  return (
+    <div>
+      <h3>Compare</h3>
+      <div className="search" style={{ marginBottom: 8 }}>
+        <select
+          value={otherId}
+          onChange={(e) => setOtherId(e.target.value)}
+          aria-label="Compare against"
+          className="run-pick"
+        >
+          <option value="">against…</option>
+          {runs
+            .filter((r) => r.id !== left?.run?.id)
+            .map((r) => (
+              <option key={r.id} value={r.id}>
+                {r.id} — {(r.task || "").slice(0, 40)}
+              </option>
+            ))}
+        </select>
+      </div>
+      {other && (
+        <table className="table">
+          <thead>
+            <tr>
+              <th></th>
+              <th>this run</th>
+              <th>other run</th>
+            </tr>
+          </thead>
+          <tbody>
+            {row("task", left?.run?.task, other?.run?.task)}
+            {row(
+              "result",
+              `${left?.run?.success ? "success" : "stopped"} · ${steps(left)} steps`,
+              `${other?.run?.success ? "success" : "stopped"} · ${steps(other)} steps`,
+            )}
+            {row("model calls", left?.exchange_count, other?.exchange_count)}
+            {row("models", (left?.models || []).join(", "), (other?.models || []).join(", "))}
+            {row("sources", (left?.sources || []).length, (other?.sources || []).length)}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+function SessionsView({ runs, selected, detail, thread, booted, onSelect, onContinue, search, onSearch }) {
   const [tab, setTab] = useState("overview");
   const filtered = useMemo(() => {
     const needle = search.trim().toLowerCase();
@@ -327,7 +567,6 @@ function SessionsView({ runs, selected, detail, booted, onSelect, search, onSear
         action={
           <div className="card-tools">
             <span className="count">{filtered.length}</span>
-            <Switch checked={auto} onChange={onAuto} label="auto" />
           </div>
         }
       >
@@ -354,7 +593,7 @@ function SessionsView({ runs, selected, detail, booted, onSelect, search, onSear
                   >
                     <span className="run-id">
                       {r.success ? <Badge tone="ok">✓</Badge> : <Badge>•</Badge>} {r.id}
-                      {!r.ended_at && <Badge tone="live">live</Badge>}
+                      {r.live && <Badge tone="live">live</Badge>}
                     </span>
                     <span className="run-task">{r.task}</span>
                   </button>
@@ -373,10 +612,21 @@ function SessionsView({ runs, selected, detail, booted, onSelect, search, onSear
         aria-label="Resize list and detail"
         onMouseDown={onDragStart}
       />
-      <Card title="Session detail" icon={ListChecks}>
+      <Card
+        title="Session detail"
+        icon={ListChecks}
+        action={
+          selected && detail?.run && !detail.run.live ? (
+            <Button variant="outline" size="sm" onClick={() => onContinue(selected)}>
+              Continue →
+            </Button>
+          ) : null
+        }
+      >
         {!selected && <p className="muted">pick a run on the left</p>}
         {selected && !detail && <SkeletonDetail />}
         {detail?.error && <p className="muted">{detail.error}</p>}
+        <ThreadStrip thread={thread} onSelect={onSelect} />
         {detail?.run && (
           <>
             <Tabs
@@ -384,10 +634,12 @@ function SessionsView({ runs, selected, detail, booted, onSelect, search, onSear
               onChange={setTab}
               tabs={[
                 { id: "overview", label: "Overview" },
+                { id: "loop", label: "Loop", count: (detail.steps || []).length },
                 { id: "sources", label: "Sources", count: sources.length },
                 { id: "steps", label: "Steps", count: (detail.steps || []).length },
               ]}
             />
+            {tab === "loop" && <ThoughtLoop runId={selected} />}
             {tab === "overview" && (
               <>
                 <KV label="task">
@@ -448,7 +700,7 @@ function SessionsView({ runs, selected, detail, booted, onSelect, search, onSear
                     </span>
                     {s.thought && <div className="muted">“{s.thought.slice(0, 160)}”</div>}
                     {(actionsByStep[s.n] || []).map((a) => (
-                      <div key={a.id} className="action-line">
+                      <div key={`${a.step_n}:${a.seq}`} className="action-line">
                         {a.outcome === "ok" ? "✓" : "✗"} {a.name} — {(a.message || "").slice(0, 90)}
                       </div>
                     ))}
@@ -457,9 +709,7 @@ function SessionsView({ runs, selected, detail, booted, onSelect, search, onSear
               </ol>
             )}
             {tab === "overview" && (
-              <Placeholder title="Compare" phase={3}>
-                Side-by-side against another run.
-              </Placeholder>
+              <CompareBlock runs={runs} left={detail} />
             )}
           </>
         )}
@@ -481,54 +731,343 @@ function rowKey(r) {
   return `${r.kind}:${r.id ?? r.rowid}`;
 }
 
-function FeedLine({ row }) {
-  if (row.kind === "step") {
-    return (
-      <div>
-        <strong>step {row.n}</strong> · {row.url || "—"}
-        {row.thought && <div className="muted">“{String(row.thought).slice(0, 140)}”</div>}
-      </div>
-    );
+// Group streamed rows into thought-cards, same shape as Session `thought_loop`
+// cards so both tabs share StepCard. Steps are written at step END, so an
+// exchange belongs to the first step whose `at` covers its `started_at`.
+function groupLiveRows(rows) {
+  const steps = rows.filter((r) => r.kind === "step").sort((a, b) => a.n - b.n);
+  const cards = steps.map((s) => ({
+    n: s.n,
+    url: s.url,
+    thought: s.thought,
+    ms: s.ms,
+    active_stage: null,
+    exchange: null,
+    actions: [],
+    planner_turn: null,
+    vision: [],
+  }));
+  const byN = new Map(cards.map((c) => [c.n, c]));
+  // Steps carry `at` (written at step end); see group docstring.
+  const atByN = new Map(steps.map((s) => [s.n, s.at || 0]));
+  for (const r of rows) {
+    if (r.kind === "action") {
+      const c = byN.get(r.step_n);
+      if (c)
+        c.actions.push({ name: r.name, outcome: r.outcome, message: r.message, why: r.why });
+    } else if (r.kind === "exchange") {
+      const at = Number(r.started_at) || 0;
+      let target = null;
+      for (const c of cards) {
+        const stepAt = Number(atByN.get(c.n)) || 0;
+        if (stepAt >= at && at > 0) {
+          target = c;
+          break;
+        }
+      }
+      target = target || cards[cards.length - 1];
+      if (!target) continue;
+      if (r.role === "planner") {
+        target.planner_turn = { model: r.model, plan: null, raw_text: r.text || "" };
+      } else if (r.role === "vision") {
+        target.vision.push({
+          exchange_id: r.id,
+          model: r.model,
+          question: r.question || "",
+          answer: r.text || "",
+        });
+      } else {
+        target.exchange = {
+          exchange_id: r.id,
+          model: r.model,
+          ms: r.ms,
+          input_tokens: r.input_tokens,
+          output_tokens: r.output_tokens,
+          text: r.text || "",
+          reasoning_summary: "",
+          tool_calls: r.tool_calls || [],
+          request: null,
+        };
+      }
+    }
   }
-  if (row.kind === "action") {
-    return (
-      <div>
-        {row.outcome === "ok" ? "✓" : "✗"} {row.name} — {String(row.message || "").slice(0, 100)}
-      </div>
-    );
-  }
-  if (row.kind === "exchange") {
-    const calls = (row.tool_calls || []).map((c) => c.name).join(", ");
-    return (
-      <div>
-        {row.role} · {row.model}
-        {row.text && <div className="muted">{String(row.text).slice(0, 140)}</div>}
-        {calls && <div className="muted">→ {calls}</div>}
-      </div>
-    );
-  }
-  return <div className="muted">· {row.url || row.canonical || "visit"}</div>;
+  return cards.slice(-60);
 }
 
-function LiveView({ runs }) {
+function NewSessionCard({ env, prefill, onPrefilled, onStarted }) {
+  const [task, setTask] = useState("");
+  const [profile, setProfile] = useState("default");
+  const [url, setUrl] = useState("");
+  const [steps, setSteps] = useState(40);
+  const [model, setModel] = useState("");
+  const [whatNext, setWhatNext] = useState("");
+  const [fromRun, setFromRun] = useState("");
+  const [state, setState] = useState("");
+  const profiles = (env?.profiles || []).map((p) => p.name);
+  if (!profiles.includes("default")) profiles.unshift("default");
+  const stepModel = env?.config?.models?.step;
+
+  // Restart-as-new prefill: task from the old run, steering as first note.
+  useEffect(() => {
+    if (prefill?.from) {
+      setFromRun(prefill.from);
+      if (prefill.task) setTask(prefill.task);
+      onPrefilled?.();
+    }
+    if (prefill?.profile) {
+      setProfile(prefill.profile);
+      onPrefilled?.();
+    }
+  }, [prefill]);
+
+  const start = async () => {
+    if (!task.trim()) {
+      setState("a task is required");
+      return;
+    }
+    setState("starting…");
+    try {
+      const res = await post("/api/runs", {
+        task: task.trim(),
+        profile,
+        start_url: url.trim(),
+        max_steps: Number(steps) || 40,
+        model: model.trim() || undefined,
+        from_run_id: fromRun || undefined,
+        what_next: whatNext.trim() || undefined,
+      });
+      if (res?.ok) {
+        setState(`started ${res.run_id} — pick it above to watch`);
+        setTask("");
+        setWhatNext("");
+        setFromRun("");
+        onStarted?.(res.run_id);
+      } else {
+        setState(`failed: ${res?.error || "unknown"}`);
+      }
+    } catch (err) {
+      setState(`failed: ${String(err?.message || err)}`);
+    }
+  };
+
+  return (
+    <Card title="New session" icon={Boxes}>
+      <p className="muted">
+        Runs as a supervised child on this machine — same <code>.env</code>, same models.
+        {stepModel?.model && (
+          <>
+            {" "}Will run <strong>{stepModel.model}</strong> on profile <strong>{profile}</strong>.
+          </>
+        )}
+      </p>
+      {fromRun && (
+        <p className="muted">
+          Continuing <strong>{fromRun}</strong> — its notes and cited sources ride along.{" "}
+          <button className="text-button" onClick={() => setFromRun("")}>
+            start fresh instead
+          </button>
+        </p>
+      )}
+      <Field label="Task">
+        <div className="search" style={{ marginBottom: 6 }}>
+          <input
+            value={task}
+            onChange={(e) => setTask(e.target.value)}
+            placeholder="e.g. compare laptop prices…"
+            aria-label="Task"
+          />
+        </div>
+      </Field>
+      {fromRun && (
+        <Field label="What next? (first instruction to the new run)">
+          <div className="search" style={{ marginBottom: 6 }}>
+            <input
+              value={whatNext}
+              onChange={(e) => setWhatNext(e.target.value)}
+              placeholder="e.g. now check amazon.com too…"
+              aria-label="What next"
+            />
+          </div>
+        </Field>
+      )}
+      <Field label="Profile">
+        <div className="search" style={{ marginBottom: 6 }}>
+          <select
+            value={profile}
+            onChange={(e) => setProfile(e.target.value)}
+            aria-label="Profile"
+            className="run-pick"
+          >
+            {profiles.map((p) => (
+              <option key={p} value={p}>
+                {p}
+              </option>
+            ))}
+          </select>
+        </div>
+      </Field>
+      <Field label="Start URL (optional)">
+        <div className="search" style={{ marginBottom: 6 }}>
+          <input
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://…"
+            aria-label="Start URL"
+          />
+        </div>
+      </Field>
+      <Field label={`Model override (default ${stepModel?.model || "…"})`}>
+        <div className="search" style={{ marginBottom: 6 }}>
+          <input
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            placeholder={stepModel?.model || "e.g. cohere/north-mini-code:free"}
+            aria-label="Model override"
+          />
+        </div>
+      </Field>
+      <Field label="Max steps">
+        <div className="search" style={{ marginBottom: 6 }}>
+          <input
+            value={steps}
+            onChange={(e) => setSteps(e.target.value)}
+            type="number"
+            min="1"
+            max="200"
+            aria-label="Max steps"
+          />
+        </div>
+      </Field>
+      <Button variant="default" size="sm" onClick={start}>
+        <Play size={13} /> Start run
+      </Button>{" "}
+      <span className="muted">{state}</span>
+    </Card>
+  );
+}
+
+const MAX_TABS = 6;
+
+function LiveView({ runs, env, prefill, onPrefilled, onRunFinished }) {
+  // VS Code-style tabs: single-click previews (italic, replaceable),
+  // double-click pins. One stream per open tab would fan out polls, so only
+  // the active tab streams; the rest restore from cache + status dots.
+  const [tabs, setTabs] = useState([]);
   const [runId, setRunId] = useState(null);
-  const [feed, setFeed] = useState([]);
+  const tabCache = React.useRef(new Map());
+
+  const openTab = useCallback(
+    (id, pin = false) => {
+      setTabs((prev) => {
+        const at = prev.findIndex((t) => t.id === id);
+        if (at >= 0) {
+          const next = prev.map((t, i) =>
+            i === at ? { ...t, pinned: t.pinned || pin } : t,
+          );
+          return next;
+        }
+        let next = prev;
+        if (!pin) {
+          const previewAt = prev.findIndex((t) => !t.pinned);
+          next = previewAt >= 0 ? prev.filter((_, i) => i !== previewAt) : prev;
+        }
+        next = [...next, { id, pinned: pin }];
+        while (next.length > MAX_TABS) {
+          const evict = next.findIndex((t) => !t.pinned && t.id !== id);
+          if (evict < 0) break;
+          next = next.filter((_, i) => i !== evict);
+        }
+        return next;
+      });
+      setRunId(id);
+    },
+    [],
+  );
+
+  const closeTab = useCallback(
+    (id) => {
+      setTabs((prev) => prev.filter((t) => t.id !== id));
+      if (runId === id) {
+        setRunId((current) => {
+          if (current !== id) return current;
+          const rest = tabs.filter((t) => t.id !== id);
+          return rest.length > 0 ? rest[rest.length - 1].id : null;
+        });
+      }
+    },
+    [runId, tabs],
+  );
+
+  const togglePin = useCallback((id) => {
+    setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, pinned: !t.pinned } : t)));
+  }, []);
+  const [rows, setRows] = useState([]);
+  const cards = useMemo(() => groupLiveRows(rows), [rows]);
   const [paused, setPaused] = useState(false);
   const [pending, setPending] = useState([]);
   const [note, setNote] = useState("");
   const [stream, setStream] = useState("idle"); // idle | live | down
   const [sendState, setSendState] = useState("");
+  const [managed, setManaged] = useState([]);
+  const [stopState, setStopState] = useState("");
+  const [logText, setLogText] = useState(null);
   const seen = React.useRef(new Set());
 
+  // Liveness is the server heartbeat flag: crashed runs never close their
+  // row, so an open `ended_at` alone would crown corpses as live.
+  // Live-only scope: tabs hold heartbeat-alive runs. A finished run
+  // auto-closes below; replay lives in Sessions, never here.
+  const liveRuns = useMemo(() => runs.filter((r) => r.live), [runs]);
+
+  const refreshManaged = useCallback(async () => {
+    try {
+      const res = await query("managed_runs");
+      if (res?.ok) setManaged(res.runs || []);
+    } catch {
+      // heartbeat only — the status button owns server health
+    }
+  }, []);
+
   useEffect(() => {
-    if (runId || runs.length === 0) return;
-    const liveRun = runs.find((r) => !r.ended_at) || runs[0];
-    setRunId(liveRun.id);
-  }, [runs, runId]);
+    refreshManaged();
+    const t = setInterval(refreshManaged, 8000);
+    return () => clearInterval(t);
+  }, [refreshManaged]);
+
+  useEffect(() => {
+    if (runId) return;
+    const liveRun = runs.find((r) => r.live);
+    if (liveRun) openTab(liveRun.id, true);
+  }, [runs, runId, openTab]);
+
+  // A watched run that ends leaves Live on its own: its tab closes and a
+  // flash links to its Session detail. Live never shows finished runs.
+  const [finishedFlash, setFinishedFlash] = useState(null);
+  useEffect(() => {
+    const dead = tabs.filter((t) => {
+      const r = runs.find((x) => x.id === t.id);
+      return r && !r.live;
+    });
+    if (dead.length === 0) return;
+    dead.forEach((t) => closeTab(t.id));
+    setFinishedFlash(dead[0].id);
+  }, [runs, closeTab]);
+
+  // Restore a tab's cached view instantly on switch; live ticks overwrite.
+  useEffect(() => {
+    if (!runId) return;
+    const cached = tabCache.current.get(runId);
+    if (cached) {
+      setRows(cached.rows);
+      seen.current = new Set(cached.rows.map(rowKey));
+      setPaused(cached.paused);
+      setPending(cached.pending);
+    }
+  }, [runId]);
 
   useEffect(() => {
     if (!runId) return;
-    setFeed([]);
+    setRows([]);
     seen.current = new Set();
     setStream("idle");
     let closed = false;
@@ -536,6 +1075,11 @@ function LiveView({ runs }) {
       if (closed || !res?.ok) return;
       setPaused(!!res.paused);
       setPending(res.pending_notes || []);
+      tabCache.current.set(runId, {
+        rows: tabCache.current.get(runId)?.rows || [],
+        paused: !!res.paused,
+        pending: res.pending_notes || [],
+      });
     });
     // Same-origin server stream. EventSource reconnects on its own; the
     // seen-set makes redelivery a no-op.
@@ -564,7 +1108,22 @@ function LiveView({ runs }) {
         seen.current.add(k);
         return true;
       });
-      if (fresh.length > 0) setFeed((prev) => [...prev.slice(-300), ...fresh]);
+      const p = !!batch.paused;
+      const pend = batch.pending_notes || [];
+      setPaused(p);
+      setPending(pend);
+      if (fresh.length > 0) {
+        setRows((prev) => {
+          const next = [...prev.slice(-500), ...fresh];
+          tabCache.current.set(runId, { rows: next, paused: p, pending: pend });
+          return next;
+        });
+      } else {
+        setRows((prev) => {
+          tabCache.current.set(runId, { rows: prev, paused: p, pending: pend });
+          return prev;
+        });
+      }
     });
     return () => {
       closed = true;
@@ -596,87 +1155,245 @@ function LiveView({ runs }) {
     }
   };
 
+  const stopRun = async () => {
+    if (!runId) return;
+    setStopState("stopping…");
+    try {
+      const res = await post(`/api/runs/${encodeURIComponent(runId)}/stop`, {});
+      setStopState(res?.ok ? `stopped (${res.result})` : `failed: ${res?.error || "?"}`);
+      refreshManaged();
+    } catch (err) {
+      setStopState(`failed: ${String(err?.message || err)}`);
+    }
+  };
+
+  const fetchLog = async () => {
+    if (!runId) return;
+    setLogText("loading…");
+    try {
+      const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/log?offset=0`).then((r) =>
+        r.json(),
+      );
+      setLogText(res?.ok ? res.text.slice(-6000) || "(empty so far)" : `failed: ${res?.error}`);
+    } catch (err) {
+      setLogText(`failed: ${String(err?.message || err)}`);
+    }
+  };
+
+  const managedIds = new Set(managed.filter((m) => m.managed).map((m) => m.run_id));
+  const watchedManaged = runId && managedIds.has(runId);
+
+  // Resizable stream/control split, persisted per browser.
+  const [rightW, setRightW] = useState(() => {
+    try {
+      const v = parseInt(localStorage.getItem("chamber-live-w") || "320", 10);
+      return Number.isFinite(v) ? Math.min(Math.max(v, 240), 560) : 320;
+    } catch {
+      return 320;
+    }
+  });
+  const onLiveDragStart = useCallback(
+    (e) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startW = rightW;
+      const move = (ev) => {
+        const w = Math.min(Math.max(startW - (ev.clientX - startX), 240), 560);
+        setRightW(w);
+        try {
+          localStorage.setItem("chamber-live-w", String(w));
+        } catch {
+          // private window — won't persist
+        }
+      };
+      const up = () => document.removeEventListener("mousemove", move);
+      document.addEventListener("mousemove", move);
+      document.addEventListener("mouseup", up, { once: true });
+    },
+    [rightW],
+  );
+
   return (
-    <div className="split" style={{ gridTemplateColumns: "minmax(0, 1fr) 320px" }}>
+    <div
+      className="split live-split"
+      style={{ gridTemplateColumns: `minmax(0, 1fr) 5px ${rightW}px` }}
+    >
       <Card
         title="Live stream"
         icon={Radio}
+        tint={runId ? "is-live" : ""}
         action={
-          stream === "live" ? (
-            <Badge tone="live">live</Badge>
-          ) : stream === "down" ? (
-            <Badge tone="warn">reconnecting…</Badge>
-          ) : (
-            <Badge>connecting…</Badge>
-          )
+          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <Badge tone="live">● live</Badge>
+            {stream === "down" && <Badge tone="warn">reconnecting…</Badge>}
+            <Button
+              variant={paused ? "default" : "outline"}
+              size="sm"
+              onClick={togglePause}
+              disabled={!runId}
+              title="Hold or release the loop"
+            >
+              {paused ? "▶ Resume" : "⏸ Pause"}
+            </Button>
+            {watchedManaged && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={stopRun}
+                disabled={!runId}
+                title="Stop this run"
+              >
+                ■ Stop
+              </Button>
+            )}
+          </div>
+        }
+        footer={
+          runId ? (
+            <div className="composer-col">
+              <div className="composer-row">
+                <div className="search" style={{ marginBottom: 0 }}>
+                  <input
+                    value={note}
+                    onChange={(e) => setNote(e.target.value)}
+                    placeholder="Instruct the model… (Enter sends)"
+                    aria-label="Note text"
+                    onKeyDown={(e) => e.key === "Enter" && sendNote()}
+                  />
+                </div>
+                <Button variant="outline" size="sm" onClick={sendNote}>
+                  Send
+                </Button>
+                <span className="muted">{sendState}</span>
+              </div>
+              {pending.length > 0 && (
+                <div className="muted">
+                  queued: {pending.map((n) => n.text.slice(0, 60)).join(" · ")}
+                </div>
+              )}
+            </div>
+          ) : null
         }
       >
-        <div className="search">
-          <select
-            value={runId || ""}
-            onChange={(e) => setRunId(e.target.value)}
-            aria-label="Watch a run"
-            className="run-pick"
-          >
-            {runs.map((r) => (
-              <option key={r.id} value={r.id}>
-                {!r.ended_at ? "● " : ""}{r.id} — {(r.task || "").slice(0, 50)}
-              </option>
-            ))}
-          </select>
-        </div>
+        {finishedFlash && (
+          <div className="notice" style={{ margin: "0 0 8px" }}>
+            {finishedFlash} finished.{" "}
+            <button className="text-button" onClick={() => onRunFinished?.(finishedFlash)}>
+              Open in Sessions
+            </button>{" "}
+            <button className="text-button" onClick={() => setFinishedFlash(null)}>
+              dismiss
+            </button>
+          </div>
+        )}
+        {runs.length === 0 ? (
+          <p className="muted">no runs yet — start one below to watch it here</p>
+        ) : tabs.length === 0 ? (
+          <div className="notice" style={{ margin: "0 0 8px" }}>
+            No live runs right now — start one below to watch it here, or review
+            finished runs in Sessions.
+          </div>
+        ) : (
+          <>
+            <div className="tabbar" role="tablist" aria-label="Watched runs">
+              {tabs.map((t) => {
+                const r = runs.find((x) => x.id === t.id);
+                return (
+                  <button
+                    key={t.id}
+                    role="tab"
+                    aria-selected={t.id === runId}
+                    className={`${t.id === runId ? "is-active" : ""}${t.pinned ? "" : " is-preview"}`}
+                    onClick={() => openTab(t.id)}
+                    onDoubleClick={() => togglePin(t.id)}
+                    title={`${r?.task || t.id}${t.pinned ? " (pinned)" : " (preview — double-click to pin)"}`}
+                  >
+                    {r?.live ? "● " : "■ "}
+                    {t.id.slice(-6)}
+                    <span
+                      className="tab-pin"
+                      role="button"
+                      aria-label={t.pinned ? "Unpin tab" : "Pin tab"}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        togglePin(t.id);
+                      }}
+                    >
+                      {t.pinned ? "◈" : "◇"}
+                    </span>
+                    <span
+                      className="tab-close"
+                      role="button"
+                      aria-label="Close tab"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        closeTab(t.id);
+                      }}
+                    >
+                      ×
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            {liveRuns.filter((r) => !tabs.some((t) => t.id === r.id)).length > 0 && (
+              <div className="live-rail">
+                <span className="muted">live now:</span>
+                {liveRuns
+                  .filter((r) => !tabs.some((t) => t.id === r.id))
+                  .map((r) => (
+                    <button key={r.id} className="text-button" onClick={() => openTab(r.id)}>
+                      ● {r.id.slice(-6)}
+                    </button>
+                  ))}
+              </div>
+            )}
+          </>
+        )}
         {paused && (
           <div className="notice" style={{ margin: "0 0 8px" }}>
             Paused — the loop holds at the next step boundary.
           </div>
         )}
-        <ul className="run-list">
-          {feed.map((r) => (
-            <li key={rowKey(r)} className="feed-line">
-              <FeedLine row={r} />
-            </li>
-          ))}
-        </ul>
-        {feed.length === 0 && (
-          <p className="muted">waiting for rows — new steps land here as the loop writes them</p>
+        {!runId ? (
+          <p className="muted">pick a run above to watch</p>
+        ) : (
+          <>
+            <div className="loop-feed">
+              {cards.map((c) => (
+                <StepCard key={c.n} runId={runId} step={c} />
+              ))}
+            </div>
+            {cards.length === 0 && (
+              <p className="muted">waiting for rows — new steps land here as the loop writes them</p>
+            )}
+          </>
         )}
       </Card>
 
-      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        <Card title="Loop control" icon={Settings}>
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <Button variant={paused ? "default" : "outline"} size="sm" onClick={togglePause}>
-              {paused ? "▶ Resume" : "⏸ Pause"}
-            </Button>
-          </div>
-          <Field label="Send the model a note" hint="Filed to the run mailbox; read at the next step.">
-            <div className="search" style={{ marginBottom: 6 }}>
-              <input
-                value={note}
-                onChange={(e) => setNote(e.target.value)}
-                placeholder="e.g. compare prices first…"
-                aria-label="Note text"
-                onKeyDown={(e) => e.key === "Enter" && sendNote()}
-              />
-            </div>
-            <Button variant="outline" size="sm" onClick={sendNote}>
-              File note
-            </Button>{" "}
-            <span className="muted">{sendState}</span>
-          </Field>
-          {pending.length > 0 && (
-            <>
-              <h3>Waiting ({pending.length})</h3>
-              <ul className="plain-list">
-                {pending.map((n) => (
-                  <li key={n.id}>✎ {n.text}</li>
-                ))}
-              </ul>
-            </>
-          )}
-        </Card>
-        <Card title="New session" icon={Boxes} action={<Badge tone="warn">Phase 3</Badge>}>
-          <p className="muted">Task box + profile picker + start. Today's equivalent is a terminal.</p>
+      <div
+        className="resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize stream and controls"
+        onMouseDown={onLiveDragStart}
+      />
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {stopState && <p className="muted">{stopState}</p>}
+        <NewSessionCard
+          env={env}
+          prefill={prefill}
+          onPrefilled={onPrefilled}
+          onStarted={(id) => {
+            openTab(id, true);
+            refreshManaged();
+          }}
+        />
+        <Card title="Run log" icon={ListChecks}>
+          <Button variant="outline" size="sm" onClick={fetchLog}>
+            Load tail
+          </Button>
+          {logText !== null && <pre className="log-view">{logText}</pre>}
         </Card>
       </div>
     </div>
@@ -725,7 +1442,7 @@ function EnvironmentView({ env, booted }) {
   );
 }
 
-function ProfilesView({ env, booted }) {
+function ProfilesView({ env, booted, onStart }) {
   return (
     <Card
       title="Profiles"
@@ -736,28 +1453,35 @@ function ProfilesView({ env, booted }) {
         <SkeletonDetail />
       ) : (
         <>
-          <table className="table">
-            <thead>
-              <tr>
-                <th>profile</th>
-                <th>size</th>
-                <th>logins</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(env?.profiles || []).map((p) => (
-                <tr key={p.name}>
-                  <td>{p.name}</td>
-                  <td>{p.size_mb} MB</td>
-                  <td>{p.logins ? "yes" : "—"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          <Placeholder title="Profile control">
-            Switch profile (closes + relaunches the browser context) · start a session on a
-            profile · cookie/login status.
-          </Placeholder>
+      <table className="table">
+        <thead>
+          <tr>
+            <th>profile</th>
+            <th>size</th>
+            <th>logins</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {(env?.profiles || []).map((p) => (
+            <tr key={p.name}>
+              <td>{p.name}</td>
+              <td>{p.size_mb} MB</td>
+              <td>{p.logins ? "yes" : "—"}</td>
+              <td>
+                <button className="text-button" onClick={() => onStart?.(p.name)}>
+                  start session
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="muted">
+        Profiles bind at session start — a running browser context cannot be re-homed
+        (tabs, JS state and refs die with the process; only cookies persist, and those
+        already live in the profile). To "switch," start a session on the other profile.
+      </p>
         </>
       )}
     </Card>
@@ -765,6 +1489,16 @@ function ProfilesView({ env, booted }) {
 }
 
 function ModelsView({ env, booted }) {
+  const [usage, setUsage] = useState(null);
+  useEffect(() => {
+    let live = true;
+    query("usage").then((res) => {
+      if (live && res?.ok) setUsage(res.models || []);
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
   return (
     <Card title="Models" icon={Boxes}>
       <p className="muted">
@@ -783,9 +1517,41 @@ function ModelsView({ env, booted }) {
           ))}
         </>
       )}
-      <Placeholder title="Model control">
-        Per-session override + free-tier budget tracking. <Badge tone="warn">Phase 3</Badge>
-      </Placeholder>
+      <h3>Usage by model</h3>
+      {!usage ? (
+        <p className="muted">loading…</p>
+      ) : usage.length === 0 ? (
+        <p className="muted">no runs recorded yet</p>
+      ) : (
+        <table className="table">
+          <thead>
+            <tr>
+              <th>model</th>
+              <th>runs</th>
+              <th>steps</th>
+              <th>in / out tokens</th>
+              <th>cost</th>
+            </tr>
+          </thead>
+          <tbody>
+            {usage.map((u) => (
+              <tr key={u.model}>
+                <td className="wrap">{u.model}</td>
+                <td>{u.runs}</td>
+                <td>{u.steps}</td>
+                <td>
+                  {u.input_tokens.toLocaleString()} / {u.output_tokens.toLocaleString()}
+                </td>
+                <td>{u.free_tier ? "$0" : "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      <p className="muted">
+        Per-session override lives in New session (model field). Prices rot, so only
+        free-tier $0 is stated; paid spend is tokens × provider price.
+      </p>
     </Card>
   );
 }
@@ -912,7 +1678,8 @@ function App() {
   const [detail, setDetail] = useState(null);
   const [notice, setNotice] = useState("");
   const [search, setSearch] = useState("");
-  const [auto, setAuto] = useState(true);
+  const [thread, setThread] = useState(null);
+  const [prefill, setPrefill] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [booted, setBooted] = useState(false);
   const [online, setOnline] = useState(true);
@@ -944,15 +1711,15 @@ function App() {
     setBooted(true);
   }, []);
 
+  // No auto-poll: SSE covers live runs, manual refresh + view-enter cover
+  // the rest. Polling full payloads on a timer was the flicker source.
   useEffect(() => {
     refresh();
   }, [refresh]);
 
   useEffect(() => {
-    if (!auto || view !== "sessions") return;
-    const t = setInterval(refresh, 5000);
-    return () => clearInterval(t);
-  }, [auto, view, refresh]);
+    refresh();
+  }, [view]);
 
   // Stale detail stays mounted while the fresh one loads — never blanked.
   // The id guard drops a late response when the user already moved on.
@@ -969,17 +1736,31 @@ function App() {
     async (id) => {
       setSelected(id);
       setDetail(null); // user-initiated switch → skeleton, not stale run
+      setThread(null);
       await fetchDetail(id);
+      try {
+        const t = await query("thread", { run_id: id });
+        if (t?.ok) setThread(t);
+      } catch {
+        // thread strip is decorative; detail stands alone
+      }
     },
     [fetchDetail],
   );
 
-  // Keep an open run's detail fresh while auto-refresh ticks.
-  useEffect(() => {
-    if (!auto || !selected || view !== "sessions") return;
-    const t = setInterval(() => fetchDetail(selected), 8000);
-    return () => clearInterval(t);
-  }, [auto, selected, view, fetchDetail]);
+  // Continue: prefill a fresh run from a finished one and land on Live.
+  const openContinue = useCallback(async (id) => {
+    try {
+      const res = await query("restart_prefill", { run_id: id });
+      if (res?.ok) setPrefill({ from: id, task: res.task || "" });
+      else setPrefill({ from: id, task: "" });
+    } catch {
+      setPrefill({ from: id, task: "" });
+    }
+    setView("live");
+  }, []);
+
+
 
   return (
     <div className="console">
@@ -1025,22 +1806,43 @@ function App() {
       {notice && <div className="notice">{notice}</div>}
 
       <main key={view} className="viewport animate-in">
-        {view === "sessions" && (
-          <SessionsView
-            runs={runs}
-            selected={selected}
-            detail={detail}
-            booted={booted}
-            onSelect={openRun}
-            search={search}
-            onSearch={setSearch}
-            auto={auto}
-            onAuto={setAuto}
-          />
-        )}
-          {view === "live" && <LiveView runs={runs} />}
+          {view === "sessions" && (
+            <SessionsView
+              runs={runs}
+              selected={selected}
+              detail={detail}
+              thread={thread}
+              booted={booted}
+              onSelect={openRun}
+              onContinue={openContinue}
+              search={search}
+              onSearch={setSearch}
+            />
+          )}
+          {view === "live" && (
+            <LiveView
+              runs={runs}
+              env={env}
+              prefill={prefill}
+              onPrefilled={() => setPrefill(null)}
+              onRunFinished={(id) => {
+                setNotice(`${id.slice(-6)} finished — opened in Sessions.`);
+                setView("sessions");
+                openRun(id);
+              }}
+            />
+          )}
         {view === "environment" && <EnvironmentView env={env} booted={booted} />}
-        {view === "profiles" && <ProfilesView env={env} booted={booted} />}
+          {view === "profiles" && (
+            <ProfilesView
+              env={env}
+              booted={booted}
+              onStart={(profile) => {
+                setPrefill({ profile });
+                setView("live");
+              }}
+            />
+          )}
         {view === "models" && <ModelsView env={env} booted={booted} />}
         {view === "settings" && <SettingsView theme={theme} setTheme={setTheme} />}
       </main>

@@ -13,6 +13,41 @@ the trace database with `chamber trace`.
 
 ---
 
+## [0.15.0] — Unreleased
+
+### Thought-loop cards, tabs, and a live-only Live view
+
+The Console learns to show the agent's thinking, not just its trail. Every
+step renders as one card — thought, model exchange, actions, planner turn,
+vision — in history and live alike, from the same renderer. Live drops
+replay entirely: heartbeat-alive runs get tabs, finished runs auto-leave to
+Sessions, and controls only ever bind a living loop.
+
+**Added**
+
+- **ThoughtLoop cards** — Session Loop tab plus live grouping in the stream;
+  planner stages, reasoning summaries, and full exchanges one click away.
+- **Tab-based runs** — preview/pin semantics with a live rail, per-tab
+  stream caches, and auto-follow for newly started runs.
+- **Composer + toolbar** — the note box docks at the stream's foot, pause
+  and stop move into the header, the Loop-control card is deleted.
+- **Continue and thread strips** — finished runs continue as linked new
+  runs (context-first notes, steering second); ancestors and continuations
+  render above the detail.
+- **Compare view, usage table, start-on-profile** — side-by-side runs,
+  per-model tokens, and profile rows that jump to a preset launch form.
+- **Polish pass** — resizable splits, fixed progress slot, skeleton
+  loading, no-bold-shift actives, light/dark toggle, full-bleed layout.
+
+**Changed**
+
+- Auto-poll intervals removed (they were the flicker engine): SSE owns
+  live, manual refresh plus refresh-on-view own the rest.
+- `/desk` over HTTP deliberately unbuilt — replay is the Loop tab, honestly
+  labeled (see contract §3).
+
+---
+
 ## [0.14.0] — Unreleased
 
 ### Supervised runs and transparent query APIs
