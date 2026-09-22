@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -164,6 +165,7 @@ class Agent:
                 task,
                 profile=self.ch.config.profile,
                 model=f"{self.llm.config.provider}/{self.llm.config.model}",
+                parent=os.environ.get("CHAMBER_PARENT_RUN", ""),
             )
 
         # Load the vision model now rather than mid-run. The first stuck moment is
@@ -195,10 +197,14 @@ class Agent:
                 # it, so every remembered ref is meaningless now.
                 self.ch.last_snapshot = None
 
-            # --- human mailbox (Phase 2) --------------------------------
-            # File-based because the Console lives in another process. A pause
-            # holds the loop here; notes join the step's feedback so the model
-            # reads them beside the fresh page, not instead of it.
+            # --- human mailbox (Phase 2/3a) -------------------------------
+            # File-based because the Console lives in another process. Stop
+            # exits cleanly (the trace closes); pause holds; notes join the
+            # step's feedback so the model reads them beside the fresh page.
+            if inbox.is_stop_requested(self.ch.run_id):
+                stopped_because = "stopped from Chamber Console"
+                summary = "Stopped by a human from Chamber Console."
+                break
             if inbox.is_paused(self.ch.run_id):
                 self._emit("paused", step=n, taken=True)
                 waited = await self._wait_while_paused()
@@ -209,8 +215,16 @@ class Agent:
                 if not text:
                     continue
                 self._emit("human_note", step=n, text=text)
+                if self.store:
+                    self.store.record_note(n, text)
                 line = f"Human note: {text}"
                 feedback = f"{feedback}\n\n{line}" if feedback else line
+
+            # Audible proof of life for the Console's liveness metric. A row
+            # whose beat goes quiet past LIVE_GRACE_S reads as dead, which is
+            # exactly what crashed runs look like — by design, not accident.
+            if self.store:
+                self.store.beat()
 
             # --- observe ---------------------------------------------------
             snap = await self.ch.observe(display_event=False)
@@ -510,8 +524,13 @@ class Agent:
         await self.ch.overlay.say(
             "paused", "Paused from Chamber Console. Resume there to continue.", "plan"
         )
+        last_beat = 0.0
         while inbox.is_paused(self.ch.run_id):
             await asyncio.sleep(poll_s)
+            # A held loop is still a live loop — keep beating (throttled).
+            if self.store and time.monotonic() - last_beat > 5.0:
+                self.store.beat()
+                last_beat = time.monotonic()
         return time.monotonic() - started
 
     # ----------------------------------------------------------------- decide

@@ -353,6 +353,7 @@ def run(
     profile: Annotated[str, typer.Option("--profile", "-p", help="Which browser profile.")] = "default",
     model: Annotated[str, typer.Option("--model", "-m", help="Override CHAMBER_MODEL.")] = "",
     max_steps: Annotated[int, typer.Option("--max-steps", help="Hard stop.")] = 40,
+    run_id: Annotated[str, typer.Option("--run-id", help="Name this run (supervisors use it to link early).")] = "",
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
 ) -> None:
     """Give the agent a task and watch it work.
@@ -381,7 +382,7 @@ def run(
         )
         raise typer.Exit(1)
 
-    result = run_async(_run_task(cfg, task, url or None))
+    result = run_async(_run_task(cfg, task, url or None, run_id or None))
 
     console.print()
     console.print(
@@ -399,7 +400,7 @@ def run(
     raise typer.Exit(0 if result.success else 1)
 
 
-async def _run_task(cfg: ChamberConfig, task: str, url: str | None):
+async def _run_task(cfg: ChamberConfig, task: str, url: str | None, run_id: str | None = None):
     from chamber.agent.loop import run_task
 
     def on_event(event: str, payload: dict) -> None:
@@ -458,7 +459,7 @@ async def _run_task(cfg: ChamberConfig, task: str, url: str | None):
             else:
                 console.print("  [green]▶ resumed[/green]")
 
-    async with Chamber.open(cfg) as ch:
+    async with Chamber.open(cfg, run_id=run_id) as ch:
         console.print(f"[dim]{ch.build.label} · profile {cfg.profile}[/dim]")
         return await run_task(ch, task, start_url=url, on_event=on_event)
 

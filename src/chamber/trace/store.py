@@ -33,6 +33,19 @@ from chamber.urls import canonical
 
 log = logging.getLogger(__name__)
 
+# A run counts as live while its loop is audibly working. `ended_at IS NULL`
+# alone is NOT liveness — crashed and killed runs never close their row, so
+# NULL means "never closed", not "running". The loop writes `last_beat`
+# every step; silence longer than this means the process is gone.
+LIVE_GRACE_S = 180.0
+
+
+def run_is_live(row: dict[str, Any]) -> bool:
+    """True only for a run that ended open AND beat recently."""
+    if row.get("ended_at") is not None:
+        return False
+    return (time.time() - float(row.get("last_beat") or 0)) < LIVE_GRACE_S
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS run (
     id          TEXT PRIMARY KEY,
@@ -45,8 +58,20 @@ CREATE TABLE IF NOT EXISTS run (
     summary     TEXT,
     stopped_because TEXT,
     input_tokens  INTEGER DEFAULT 0,
-    output_tokens INTEGER DEFAULT 0
+    output_tokens INTEGER DEFAULT 0,
+    last_beat   REAL,
+    parent_run  TEXT
 );
+
+CREATE TABLE IF NOT EXISTS note (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id    TEXT NOT NULL REFERENCES run(id),
+    step_n    INTEGER,
+    text      TEXT NOT NULL,
+    at        REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_note_run ON note(run_id, id);
 
 CREATE TABLE IF NOT EXISTS step (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,14 +156,38 @@ class TraceStore:
     # ------------------------------------------------------------------ writes
 
     def start_run(
-        self, run_id: str, task: str, *, profile: str, model: str = ""
+        self, run_id: str, task: str, *, profile: str, model: str = "",
+        parent: str = "",
     ) -> None:
         self.run_id = run_id
         with self.conn:
             self.conn.execute(
-                "INSERT OR REPLACE INTO run (id, task, profile, model, started_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (run_id, task, profile, model, time.time()),
+                "INSERT OR REPLACE INTO run (id, task, profile, model, started_at, parent_run) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id, task, profile, model, time.time(), parent or None),
+            )
+
+    def record_note(self, n: int | None, text: str) -> None:
+        """A claimed human note, with the step that read it. Thread memory."""
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO note (run_id, step_n, text, at) VALUES (?, ?, ?, ?)",
+                (self.run_id, n, text[:4000], time.time()),
+            )
+
+    def notes(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM note WHERE run_id=? ORDER BY id", (run_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def beat(self) -> None:
+        """Mark the loop alive. Called every step; cheap single UPDATE."""
+        if not self.run_id:
+            return
+        with self.conn:
+            self.conn.execute(
+                "UPDATE run SET last_beat=? WHERE id=?", (time.time(), self.run_id)
             )
 
     def end_run(
@@ -326,11 +375,32 @@ class TraceStore:
         rows = self.conn.execute(
             "SELECT * FROM run ORDER BY started_at DESC LIMIT ?", (limit,)
         ).fetchall()
-        return [dict(r) for r in rows]
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["live"] = run_is_live(d)
+            out.append(d)
+        return out
 
     def run(self, run_id: str) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM run WHERE id=?", (run_id,)).fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        d = dict(row)
+        d["live"] = run_is_live(d)
+        return d
+
+    def children(self, run_id: str) -> list[dict[str, Any]]:
+        """Runs continued from this one, oldest first. The thread forward."""
+        try:
+            rows = self.conn.execute(
+                "SELECT id, task, success, ended_at, started_at FROM run"
+                " WHERE parent_run=? ORDER BY started_at",
+                (run_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []  # pre-thread database
+        return [dict(r) for r in rows]
 
     def steps(self, run_id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(
@@ -484,6 +554,11 @@ def open_store(path: Path | None = None) -> Iterator[TraceStore]:
     # WAL so a reader (a status view, another shell) can look at a live run.
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(run)").fetchall()]
+    if "last_beat" not in cols:
+        conn.execute("ALTER TABLE run ADD COLUMN last_beat REAL")
+    if "parent_run" not in cols:
+        conn.execute("ALTER TABLE run ADD COLUMN parent_run TEXT")
     try:
         yield TraceStore(conn)
     finally:

@@ -13,6 +13,25 @@ the trace database with `chamber trace`.
 
 ---
 
+## [0.13.0] — Unreleased
+
+### Liveness is a heartbeat; runs gain threads and memory
+
+**Added**
+
+- **Heartbeat liveness** — the loop writes `last_beat` every step (throttled
+  while paused); a run counts as live only with an open row *and* a recent
+  beat. Crashed runs never close their row, so `ended_at IS NULL` alone kept
+  crowning corpses as live. Legacy databases migrate with one `ALTER TABLE`.
+- **Thread model** — `parent_run` link plus a `note` table: claimed mailbox
+  notes persist with the step that read them, and continuations link forward
+  without resurrecting ids.
+- **Run identity for supervisors** — `Chamber.open(run_id=…)` and
+  `chamber run --run-id`, so a supervisor can name a run before its first
+  step lands; graceful stop flag honoured at the step boundary.
+
+---
+
 ## [0.12.0] — 2026-09-20
 
 ### Live runs and a human mailbox

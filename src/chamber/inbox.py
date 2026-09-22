@@ -20,8 +20,10 @@ not in the trace store. Persistence is Phase 3 work.
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -31,6 +33,8 @@ from typing import Any
 from chamber import paths
 
 log = logging.getLogger(__name__)
+
+_SEQ = itertools.count()
 
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,64}")
 
@@ -63,7 +67,11 @@ def post_note(run_id: str, text: str) -> dict[str, Any]:
         "text": text[:4000],
         "at": time.time(),
     }
-    path = inbox_dir(run_id) / "new" / f"{note['id']}.json"
+    # Sortable names keep claim order chronological: context before
+    # steering, older notes before newer ones._ns alone can collide on
+    # coarse clocks, so pid+sequence disambiguate.
+    stamp = f"{time.time_ns():020d}-{os.getpid():06d}-{next(_SEQ):06d}"
+    path = inbox_dir(run_id) / "new" / f"{stamp}-{note['id']}.json"
     path.write_text(json.dumps(note), encoding="utf-8")
     return note
 
@@ -105,15 +113,38 @@ def claim_notes(run_id: str) -> list[dict[str, Any]]:
 
 def is_paused(run_id: str) -> bool:
     """Whether a human currently holds the loop. Never raises."""
+    return bool(_read_control(run_id).get("paused", False))
+
+
+def _read_control(run_id: str) -> dict[str, Any]:
     try:
         data = json.loads(control_path(run_id).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, ValueError):
-        return False
-    return bool(data.get("paused", False))
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def set_paused(run_id: str, paused: bool) -> dict[str, Any]:
     """Hold or release the loop. The loop polls this every step."""
-    state = {"paused": bool(paused), "at": time.time()}
+    state = {**_read_control(run_id), "paused": bool(paused), "at": time.time()}
     control_path(run_id).write_text(json.dumps(state), encoding="utf-8")
     return state
+
+
+def request_stop(run_id: str) -> dict[str, Any]:
+    """Ask the loop to finish cleanly at the next step boundary.
+
+    Distinct from pause: pause waits, stop exits — the trace closes with
+    "stopped from Chamber Console" instead of hanging open.
+    """
+    state = {**_read_control(run_id), "stop": True, "at": time.time()}
+    control_path(run_id).write_text(json.dumps(state), encoding="utf-8")
+    return state
+
+
+def is_stop_requested(run_id: str) -> bool:
+    """Whether a stop was requested. Never raises."""
+    try:
+        return bool(_read_control(run_id).get("stop", False))
+    except ValueError:
+        return False

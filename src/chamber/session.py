@@ -38,7 +38,7 @@ from playwright.async_api import (
     Error as PWError,
 )
 
-from chamber import paths
+from chamber import inbox, paths
 from chamber.actions.result import ActionResult, Outcome
 from chamber.actions.schema import AnyAction, parse_action
 from chamber.browser import launcher
@@ -166,10 +166,17 @@ class Chamber:
 
     @classmethod
     @contextlib.asynccontextmanager
-    async def open(cls, config: ChamberConfig | None = None):
-        """Launch a browser and yield a session. Closes cleanly on exit."""
+    async def open(cls, config: ChamberConfig | None = None, run_id: str | None = None):
+        """Launch a browser and yield a session. Closes cleanly on exit.
+
+        `run_id` lets a supervisor name the run up front so the Console can
+        link to it before the first step lands. Generated when omitted.
+        """
         config = config or ChamberConfig.from_env()
-        run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        if run_id:
+            inbox.check_run_id(run_id)
+        else:
+            run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
 
         pw = await async_playwright().start()
         try:
