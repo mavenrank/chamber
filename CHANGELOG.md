@@ -13,6 +13,36 @@ the trace database with `chamber trace`.
 
 ---
 
+## [0.14.0] — Unreleased
+
+### Supervised runs and transparent query APIs
+
+Runs start, pause, and stop from the Console now — spawned as children that
+inherit the server's environment, tracked in a registry, tailed through
+`console.log`, and stopped gracefully first (flag) and forcibly only if a
+run won't die. The read path grows up alongside: incremental thought-loop
+joins, slim exchange bodies, an ended-run cache, and one persistent read
+connection per stream.
+
+**Added**
+
+- **Supervisor** (`supervisor.py`) — spawn/track/stop with log tails;
+  `POST /api/runs`, `/stop`, `/log` endpoints; orphan reconciliation against
+  the trace so a restarted server never hides a run.
+- **Restart-as-new wiring** — `POST /api/runs` accepts `from_run_id` plus a
+  steering note: planner notes, cited sources, trails and pending notes are
+  bundled into one capped context note filed before spawn, the parent id
+  travels via environment, and threads stay queryable without resurrecting
+  ids.
+- **ThoughtLoop query ops** — `thought_loop` (incremental via `since_step`,
+  step numbers parsed from stored prompts, planner turns and vision joined)
+  and `exchange_detail` (full bodies on demand, capped and flagged). 15 steps
+  in 16KB where `get_run` ships 765KB.
+- **`usage_by_model` and `thread` ops** — per-model runs/steps/tokens and
+  ancestor/children thread views, on all three transports.
+
+---
+
 ## [0.13.0] — Unreleased
 
 ### Liveness is a heartbeat; runs gain threads and memory

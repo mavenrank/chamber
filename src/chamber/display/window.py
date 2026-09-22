@@ -219,6 +219,30 @@ class ChamberDesk:
                 return {"ok": True, **_q.get_run(str(payload.get("run_id", "")))}
             if op == "run_state":
                 return {"ok": True, **_q.run_state(str(payload.get("run_id", "")))}
+            if op == "thought_loop":
+                try:
+                    since = int(payload.get("since_step", 0) or 0)
+                except (TypeError, ValueError):
+                    since = 0
+                return {
+                    "ok": True,
+                    **_q.thought_loop(str(payload.get("run_id", "")), since_step=since),
+                }
+            if op == "managed_runs":
+                from chamber import supervisor as _sup
+
+                return {"ok": True, "runs": _sup.managed_runs()}
+            if op == "thread":
+                return {"ok": True, **_q.thread(str(payload.get("run_id", "")))}
+            if op == "usage":
+                return {"ok": True, **_q.usage_by_model()}
+            if op == "exchange_detail":
+                return {
+                    "ok": True,
+                    **_q.exchange_detail(
+                        str(payload.get("run_id", "")), str(payload.get("exchange_id", ""))
+                    ),
+                }
             if op == "list_profiles":
                 return {"ok": True, "profiles": _q.list_profiles()}
             if op == "get_environment":

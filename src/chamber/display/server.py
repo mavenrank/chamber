@@ -37,6 +37,27 @@ DEFAULT_PORT = 5192
 _LIVE_HOLD_S = 20.0
 _LIVE_POLL_S = 1.0
 
+# Ended runs are immutable: full payloads cached per process, forever.
+# Live runs bypass. Keyed (op, run_id); ~1MB worst case per entry.
+_ENDED_CACHE: dict[tuple[str, str], dict[str, object]] = {}
+
+
+def _cached_full(op: str, run_id: str, loader):  # loader() -> dict
+    """Serve ended runs from memory; live runs always fresh.
+
+    A 1ms `ended_at` lookup saves re-shipping ~765KB per poll for the big
+    runs reviewers actually open. Correctness rests on one fact: a row with
+    `ended_at` set never changes again.
+    """
+    hit = _ENDED_CACHE.get((op, run_id))
+    if hit is not None:
+        return dict(hit)
+    payload = loader()
+    run = payload.get("run") if isinstance(payload, dict) else None
+    if isinstance(run, dict) and run.get("ended_at") is not None:
+        _ENDED_CACHE[(op, run_id)] = payload
+    return payload
+
 
 class ConsoleHandler(SimpleHTTPRequestHandler):
     """Static `dist/` + JSON query API. Localhost only by construction."""
@@ -84,8 +105,32 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                         {"ok": True, "runs": _q.list_runs(limit=min(max(limit, 1), 50))}
                     )
                 if op == "get_run":
+                    run_id = (args.get("run_id") or [""])[0]
                     return self._json(
-                        {"ok": True, **_q.get_run((args.get("run_id") or [""])[0])}
+                        {"ok": True, **_cached_full("get_run", run_id, lambda: _q.get_run(run_id))}
+                    )
+                if op == "thought_loop":
+                    run_id = (args.get("run_id") or [""])[0]
+                    try:
+                        since = int((args.get("since_step") or ["0"])[0] or 0)
+                    except (TypeError, ValueError):
+                        since = 0
+                    if since <= 0:
+                        payload = _cached_full(
+                            "thought_loop", run_id, lambda: _q.thought_loop(run_id)
+                        )
+                    else:
+                        payload = _q.thought_loop(run_id, since_step=since)
+                    return self._json({"ok": True, **payload})
+                if op == "exchange_detail":
+                    return self._json(
+                        {
+                            "ok": True,
+                            **_q.exchange_detail(
+                                (args.get("run_id") or [""])[0],
+                                (args.get("exchange_id") or [""])[0],
+                            ),
+                        }
                     )
                 if op == "list_profiles":
                     return self._json({"ok": True, "profiles": _q.list_profiles()})
@@ -93,11 +138,49 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                     return self._json({"ok": True, **_q.get_environment()})
                 if op == "run_state":
                     return self._json({"ok": True, **_q.run_state((args.get("run_id") or [""])[0])})
+                if op == "managed_runs":
+                    from chamber import supervisor as _sup
+
+                    return self._json({"ok": True, "runs": _sup.managed_runs()})
+                if op == "restart_prefill":
+                    return self._json(
+                        {"ok": True, **_q.restart_context((args.get("run_id") or [""])[0])}
+                    )
+                if op == "thread":
+                    return self._json(
+                        {"ok": True, **_q.thread((args.get("run_id") or [""])[0])}
+                    )
+                if op == "usage":
+                    return self._json({"ok": True, **_q.usage_by_model()})
+                if op == "exchange_detail":
+                    return self._json(
+                        {
+                            "ok": True,
+                            **_q.exchange_detail(
+                                (args.get("run_id") or [""])[0],
+                                (args.get("exchange_id") or [""])[0],
+                            ),
+                        }
+                    )
                 return self._json({"ok": False, "error": f"unknown op: {op}"}, 400)
             except Exception as exc:
                 return self._json({"ok": False, "error": str(exc)[:300]}, 500)
         if parsed.path == "/api/live":
             return self._serve_live(parse_qs(urlparse(self.path).query))
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "runs" and parts[3] == "log":
+            from chamber import supervisor as _sup
+
+            try:
+                run_id = _box.check_run_id(parts[2])
+            except ValueError as exc:
+                return self._json({"ok": False, "error": str(exc)}, 400)
+            args = parse_qs(parsed.query)
+            try:
+                offset = int((args.get("offset") or ["0"])[0] or 0)
+            except (TypeError, ValueError):
+                offset = 0
+            return self._json({"ok": True, **_sup.read_log(run_id, offset)})
         if parsed.path in ("/", "/index.html"):
             self.path = "/console.html"
         return super().do_GET()
@@ -108,30 +191,99 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
         except self._DEAD_SOCKET:
             log.debug("desk query client went away mid-post")
 
-    def _handle_post(self) -> None:
-        parsed = urlparse(self.path)
-        if parsed.path not in ("/api/inbox", "/api/pause"):
-            return self._json({"ok": False, "error": "unknown endpoint"}, 404)
+    def _read_json_body(self) -> tuple[dict[str, object] | None, str]:
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except (TypeError, ValueError):
             length = 0
+        if length > 65536:
+            return None, "body too large"
         try:
-            body = json.loads(self.rfile.read(max(length, 0)) or b"{}")
+            raw = self.rfile.read(max(length, 0)) or b"{}"
+            data = json.loads(raw)
         except json.JSONDecodeError:
-            return self._json({"ok": False, "error": "body must be JSON"}, 400)
-        try:
-            run_id = _box.check_run_id(str(body.get("run_id", "")))
-        except ValueError as exc:
-            return self._json({"ok": False, "error": str(exc)}, 400)
-        try:
-            if parsed.path == "/api/inbox":
-                return self._json({"ok": True, "note": _box.post_note(run_id, str(body.get("text", "")))})
-            return self._json({"ok": True, "state": _box.set_paused(run_id, bool(body.get("paused")))})
-        except ValueError as exc:
-            return self._json({"ok": False, "error": str(exc)}, 400)
-        except OSError as exc:
-            return self._json({"ok": False, "error": str(exc)[:200]}, 500)
+            return None, "body must be JSON"
+        if not isinstance(data, dict):
+            return None, "body must be a JSON object"
+        return data, ""
+
+    def _handle_post(self) -> None:
+        from chamber import supervisor as _sup
+
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path in ("/api/inbox", "/api/pause"):
+            body, err = self._read_json_body()
+            if body is None:
+                return self._json({"ok": False, "error": err}, 400)
+            try:
+                run_id = _box.check_run_id(str(body.get("run_id", "")))
+            except ValueError as exc:
+                return self._json({"ok": False, "error": str(exc)}, 400)
+            try:
+                if path == "/api/inbox":
+                    return self._json(
+                        {"ok": True, "note": _box.post_note(run_id, str(body.get("text", "")))}
+                    )
+                return self._json(
+                    {"ok": True, "state": _box.set_paused(run_id, bool(body.get("paused")))}
+                )
+            except ValueError as exc:
+                return self._json({"ok": False, "error": str(exc)}, 400)
+            except OSError as exc:
+                return self._json({"ok": False, "error": str(exc)[:200]}, 500)
+        if path == "/api/runs":
+            # Start a supervised run. Inheriting the server's environment is
+            # deliberate: same `.env`, same models — the Start form shows the
+            # resolved config first so the click is informed consent.
+            body, err = self._read_json_body()
+            if body is None:
+                return self._json({"ok": False, "error": err}, 400)
+            from_run = str(body.get("from_run_id", "") or "")
+            what_next = str(body.get("what_next", "") or "")
+            parent, notes = "", []
+            task = str(body.get("task", ""))
+            if from_run:
+                # Restart-as-new: context first, steering second. The task
+                # defaults to the old one; the thread link is the parent id.
+                ctx = _q.restart_context(from_run)
+                if ctx.get("run") is None:
+                    return self._json(
+                        {"ok": False, "error": ctx.get("error", "no such run")}, 400
+                    )
+                parent = from_run
+                notes.append(ctx["context_note"])
+                if not task.strip():
+                    task = ctx["task"]
+            if what_next.strip():
+                notes.append(what_next.strip())
+            try:
+                spec = _sup.RunSpec(
+                    task=task,
+                    profile=str(body.get("profile", "") or "default"),
+                    start_url=str(body.get("start_url", "") or ""),
+                    max_steps=body.get("max_steps", 40),
+                    model=str(body.get("model", "") or ""),
+                )
+            except ValueError as exc:
+                return self._json({"ok": False, "error": str(exc)}, 400)
+            try:
+                return self._json(
+                    {"ok": True, **_sup.start_run(spec, parent=parent, notes=notes)}, 202
+                )
+            except RuntimeError as exc:
+                return self._json({"ok": False, "error": str(exc)[:300]}, 500)
+        parts = path.strip("/").split("/")
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "runs" and parts[3] == "stop":
+            try:
+                run_id = _box.check_run_id(parts[2])
+            except ValueError as exc:
+                return self._json({"ok": False, "error": str(exc)}, 400)
+            try:
+                return self._json({"ok": True, **_sup.stop_run(run_id)})
+            except OSError as exc:
+                return self._json({"ok": False, "error": str(exc)[:200]}, 500)
+        return self._json({"ok": False, "error": "unknown endpoint"}, 404)
 
     def _serve_live(self, args: dict[str, list[str]]) -> None:
         """Hold an SSE stream tailing one run's trace rows. EventSource
@@ -150,25 +302,34 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             self.wfile.flush()
         except self._DEAD_SOCKET:
             return
+        from chamber.trace.store import open_store
+
         deadline = time.monotonic() + _LIVE_HOLD_S
         seq = 0
-        while time.monotonic() < deadline:
-            try:
-                batch, cursor = _tail_since(run_id, cursor)
-                if batch["rows"]:
-                    seq += 1
-                    line = f"id: {seq}\nevent: tick\ndata: {json.dumps(batch, default=str)}\n\n"
-                    self.wfile.write(line.encode())
-                    self.wfile.flush()
-                else:
-                    self.wfile.write(b": hb\n\n")
-                    self.wfile.flush()
-                time.sleep(_LIVE_POLL_S)
-            except self._DEAD_SOCKET:
-                return
-            except Exception as exc:  # a bad poll must not kill the stream
-                log.debug("live tail poll failed: %s", exc)
-                time.sleep(_LIVE_POLL_S)
+        # One read connection for the whole hold — not open-per-second.
+        # Migration runs once here; WAL lets the writer proceed regardless.
+        with open_store() as store:
+            conn = store.conn
+            while time.monotonic() < deadline:
+                try:
+                    batch, cursor = _tail_since(conn, run_id, cursor)
+                    if batch["rows"]:
+                        seq += 1
+                        line = (
+                            f"id: {seq}\nevent: tick\n"
+                            f"data: {json.dumps(batch, default=str)}\n\n"
+                        )
+                        self.wfile.write(line.encode())
+                        self.wfile.flush()
+                    else:
+                        self.wfile.write(b": hb\n\n")
+                        self.wfile.flush()
+                    time.sleep(_LIVE_POLL_S)
+                except self._DEAD_SOCKET:
+                    return
+                except Exception as exc:  # a bad poll must not kill the stream
+                    log.debug("live tail poll failed: %s", exc)
+                    time.sleep(_LIVE_POLL_S)
 
 
 def _slim_exchange(row: object) -> dict[str, object]:
@@ -184,8 +345,22 @@ def _slim_exchange(row: object) -> dict[str, object]:
     except (TypeError, ValueError):
         response = {}
     calls = response.get("tool_calls") or []
+    question = ""
+    try:
+        request = json.loads(d.get("request_json") or "{}")
+        messages = request.get("messages") or []
+        for message in reversed(messages):
+            if isinstance(message, dict) and message.get("role") == "user":
+                content = message.get("content", "")
+                if isinstance(content, str) and content.strip():
+                    question = content[:300]
+                    break
+    except (TypeError, ValueError):
+        question = ""
     return {
         "kind": "exchange",
+        "id": d.get("id"),
+        "started_at": d.get("started_at"),
         "rowid": d.get("rowid"),
         "role": d.get("role"),
         "model": d.get("model"),
@@ -193,6 +368,7 @@ def _slim_exchange(row: object) -> dict[str, object]:
         "input_tokens": d.get("input_tokens"),
         "output_tokens": d.get("output_tokens"),
         "text": str(response.get("text", ""))[:300],
+        "question": question,
         "tool_calls": [
             {"name": c.get("name", "")} for c in calls if isinstance(c, dict)
         ][:4],
@@ -210,40 +386,40 @@ def _parse_cursor(raw: str) -> tuple[int, int, int, int]:
 
 
 def _tail_since(
-    run_id: str, cursor: tuple[int, int, int, int]
+    conn, run_id: str, cursor: tuple[int, int, int, int]
 ) -> tuple[dict[str, object], tuple[int, int, int, int]]:
-    """Rows landed since the watermarks, plus the new watermarks."""
-    from chamber.trace.store import open_store
+    """Rows landed since the watermarks, plus the new watermarks.
 
+    Takes an open read connection — the stream holds one for its whole
+    duration instead of opening per poll.
+    """
     step_id, action_id, x_rowid, visit_id = cursor
-    with open_store() as store:
-        conn = store.conn
-        steps = [
-            dict(r)
-            for r in conn.execute(
-                "SELECT * FROM step WHERE run_id=? AND id>? ORDER BY id", (run_id, step_id)
-            ).fetchall()
-        ]
-        actions = [
-            dict(r)
-            for r in conn.execute(
-                "SELECT * FROM action WHERE run_id=? AND id>? ORDER BY id", (run_id, action_id)
-            ).fetchall()
-        ]
-        exchanges = [
-            _slim_exchange(r)
-            for r in conn.execute(
-                "SELECT rowid, * FROM model_exchange WHERE run_id=? AND rowid>? "
-                "ORDER BY rowid",
-                (run_id, x_rowid),
-            ).fetchall()
-        ]
-        visits = [
-            dict(r)
-            for r in conn.execute(
-                "SELECT * FROM visit WHERE run_id=? AND id>? ORDER BY id", (run_id, visit_id)
-            ).fetchall()
-        ]
+    steps = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT * FROM step WHERE run_id=? AND id>? ORDER BY id", (run_id, step_id)
+        ).fetchall()
+    ]
+    actions = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT * FROM action WHERE run_id=? AND id>? ORDER BY id", (run_id, action_id)
+        ).fetchall()
+    ]
+    exchanges = [
+        _slim_exchange(r)
+        for r in conn.execute(
+            "SELECT rowid, * FROM model_exchange WHERE run_id=? AND rowid>? "
+            "ORDER BY rowid",
+            (run_id, x_rowid),
+        ).fetchall()
+    ]
+    visits = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT * FROM visit WHERE run_id=? AND id>? ORDER BY id", (run_id, visit_id)
+        ).fetchall()
+    ]
     for s in steps:
         s["kind"] = "step"
     for a in actions:
@@ -271,3 +447,10 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
     """Block serving forever. Ctrl+C stops it (handled by the CLI)."""
     with ThreadingHTTPServer((host, port), ConsoleHandler) as httpd:
         httpd.serve_forever()
+
+
+# NOTE (standing decision): there is intentionally NO /desk route. The Desk
+# bundle is loop-owned and fed over a private channel; serving it over HTTP
+# would imply a snapshot transport that doesn't exist. Trace replay lives in
+# the Session Loop tab (`thought_loop`), which is the same data honestly
+# labeled. Revisit only alongside a real snapshot bus (see contract §3).

@@ -94,6 +94,22 @@ def test_human_note_and_paused_events_render():
     assert resumed["events"][-1]["title"] == "Loop resumed"
 
 
+def test_usage_by_model(monkeypatch, tmp_path):
+    from chamber.display import queries as q
+    from chamber.trace.store import open_store
+
+    monkeypatch.setenv("CHAMBER_HOME", str(tmp_path / ".chamber"))
+    with open_store() as store:
+        store.start_run("r1", "t", profile="default", model="openai/m:free")
+        store.end_run(success=True, summary="s", input_tokens=100, output_tokens=10)
+        store.start_run("r2", "t", profile="default", model="openai/other")
+    usage = q.usage_by_model()["models"]
+    by_name = {u["model"]: u for u in usage}
+    assert by_name["openai/m:free"]["free_tier"] is True
+    assert by_name["openai/m:free"]["input_tokens"] == 100
+    assert by_name["openai/other"]["free_tier"] is False
+
+
 def test_queries_are_read_only_and_shaped():
     runs = q.list_runs(limit=5)
     assert isinstance(runs, list)

@@ -14,4 +14,4 @@ from chamber.config import ChamberConfig
 from chamber.session import Chamber
 
 __all__ = ["Chamber", "ChamberConfig", "__version__"]
-__version__ = "0.13.0"
+__version__ = "0.14.0"
